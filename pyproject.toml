@@ -1,0 +1,36 @@
+[project]
+name = "sc2-sdk"
+version = "0.1.0"
+description = "An SDK that lets an LLM coding agent install, connect to, and play StarCraft II, built on python-sc2."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = { text = "MIT" }
+dependencies = [
+    # PyPI project name for the `python-sc2` library is `burnysc2`; it is imported as `sc2`.
+    "burnysc2>=7.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+sc2-sdk-setup = "install.cli:main"
+sc2-sdk-play = "sdk.play:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# Lets `import install` / `import sdk` resolve without an editable install, so
+# `pytest` works right after clone (pip install -e . is still the recommended path).
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "integration: boots a real local SC2 process; requires a working local client install (see README.md).",
+]

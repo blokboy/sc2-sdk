@@ -1,0 +1,33 @@
+name: Integration (real SC2 game, Docker)
+
+# Ticket #9: build the self-contained Docker image (headless SC2 client +
+# map pool installed inside the container via `sc2-sdk-setup`, see
+# ../../Dockerfile) and run the real, non-mocked integration suite against
+# it on every push/PR -- so "the real game passes" stays continuously
+# verified rather than a one-time manual check.
+#
+# GitHub's standard Linux runners are x86_64, which matches the headless
+# client's architecture (see Dockerfile comment) -- no QEMU emulation layer
+# is involved here, unlike a local build on an Apple Silicon host.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    # Generous: `sc2-sdk-setup`'s headless-client extraction (pure-Python
+    # zipfile decrypting a ~4GB PKWARE-encrypted archive, see
+    # src/install/headless.py) was observed to be slow in local testing
+    # under emulation -- see the Dockerfile's comment and ticket #9's
+    # implementation notes for exactly what was and wasn't timed natively.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build integration image
+        run: docker build -t sc2-sdk-integration .
+
+      - name: Run integration suite in container
+        run: docker run --rm sc2-sdk-integration

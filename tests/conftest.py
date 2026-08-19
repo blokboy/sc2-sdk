@@ -1,0 +1,55 @@
+"""This project's single integration-test harness.
+
+Every later ticket's tests are expected to build on the `sc2_game_harness`
+fixture defined here, per the spec's testing decision: "One primary seam:
+integration tests exercise the SDK's public API against a real, locally-
+running headless SC2 instance ... asserting on actual subsequent game state
+... rather than mocking python-sc2."
+
+Design notes:
+  - `sc2_install` probes for a local SC2 client using install.paths (our own
+    module, not sc2.paths.Paths) specifically because sc2.paths.Paths calls
+    sys.exit(1) when nothing is found -- fine for a bot script, but it would
+    kill the entire pytest process rather than letting a test skip cleanly.
+  - If no local install is found, integration tests SKIP (not fail, not
+    error) with a message telling a human what to run. This lets the suite
+    stay green in environments (like a plain CI runner or this sandbox)
+    that can't run a real SC2 client, while still being a real, non-mocked
+    test wherever a working install is available.
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+import pytest
+
+from install.paths import Sc2Installation, find_installed_base
+from sc2.data import Result
+
+
+@pytest.fixture(scope="session")
+def sc2_install() -> Sc2Installation:
+    installation = find_installed_base()
+    if installation is None:
+        pytest.skip(
+            "No local SC2 installation found (checked $SC2PATH, Battle.net's "
+            "ExecuteInfo.txt, and this platform's default install directory). "
+            "Run `python -m install.cli` (see README.md) to install one, then "
+            "re-run the integration tests."
+        )
+    return installation
+
+
+@pytest.fixture(scope="session")
+def sc2_game_harness(sc2_install: Sc2Installation) -> Callable[..., Result]:
+    """Returns a callable with the same signature as
+    sdk.play.play_vs_builtin_ai, bound to a confirmed-present local install.
+
+    Kept as a thin wrapper (rather than re-exporting play_vs_builtin_ai
+    directly) so later tickets have one fixture name to depend on regardless
+    of how the underlying play function's module/location evolves.
+    """
+    from sdk.play import play_vs_builtin_ai
+
+    return play_vs_builtin_ai
