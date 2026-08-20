@@ -8,6 +8,15 @@ license = { text = "MIT" }
 dependencies = [
     # PyPI project name for the `python-sc2` library is `burnysc2`; it is imported as `sc2`.
     "burnysc2>=7.2.0",
+    # Official Python MCP SDK, for ticket #6's `execute_code` interactive
+    # server (src/sdk/mcp_server.py). Pinned below 2.0.0 deliberately: 2.0.0
+    # landed on PyPI as a from-scratch API redesign (mcp.server.fastmcp is
+    # gone in favor of mcp.server.mcpserver, among other breaking changes)
+    # right around when this ticket was implemented, with none of the
+    # ecosystem (docs, examples, other MCP servers) yet built against it.
+    # 1.x's mcp.server.fastmcp.FastMCP is the well-established, documented
+    # surface this module is built against.
+    "mcp>=1.2.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -18,6 +27,7 @@ dev = [
 [project.scripts]
 sc2-sdk-setup = "install.cli:main"
 sc2-sdk-play = "sdk.play:main"
+sc2-sdk-mcp = "sdk.mcp_server:main"
 
 [build-system]
 requires = ["setuptools>=68"]

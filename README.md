@@ -7,9 +7,10 @@ Client install/detection and map pool sync (ticket #2) plus a raw
 connect-and-play script against the game's built-in AI are the walking
 skeleton. The verified `bot.*`/`sdk.*` action/observation API (ticket #3) is
 built on top of that -- see "Play a verified bot against the built-in AI"
-below. Per-race macro helpers (Protoss/Zerg), the MCP server, and the
-autonomous script runtime are later tickets; see the
-[full spec](https://github.com/blokboy/sc2-sdk/issues/1).
+below. Per-race macro helpers (Protoss/Zerg) extend the same API (#4/#5). The
+MCP `execute_code` interactive server (ticket #6) is built on top of all of
+that -- see "Play interactively via MCP" below. The autonomous script runtime
+is a later ticket; see the [full spec](https://github.com/blokboy/sc2-sdk/issues/1).
 
 ## Install
 
@@ -134,6 +135,48 @@ example, including how invalid actions (insufficient resources, illegal
 placement, an unknown unit tag) come back as clear `ok=False` errors instead
 of silently no-op'ing.
 
+## Play interactively via MCP (ticket #6)
+
+`sc2-sdk-mcp` (or `python -m sdk.mcp_server`) launches a real game against
+the built-in AI and serves a single MCP tool, `execute_code`, over stdio:
+
+```bash
+sc2-sdk-mcp
+```
+
+Point any MCP client at it (e.g. add it as a stdio MCP server in your
+agent's config) and call `execute_code` with a Python snippet -- it runs
+against live `bot`/`sdk` globals bound to the running game, exactly like a
+direct call from a `VerifiedBotAI.on_step` would:
+
+```python
+# one execute_code call's `code` argument:
+from sc2.ids.unit_typeid import UnitTypeId
+await bot.train(UnitTypeId.SCV)
+```
+
+The response is JSON: `{"ok": ..., "result": ..., "stdout": ..., "error":
+..., "traceback": ...}` -- `result` is `repr()` of the snippet's trailing
+expression value (if any, auto-`await`-ed if it's a coroutine), `stdout` is
+anything the snippet printed, and a failing snippet (a syntax error, a
+raised exception) comes back as a structured `ok=False`/`error` result
+instead of crashing the session.
+
+**The game only advances when you call `execute_code`.** It runs in
+python-sc2's non-realtime/stepped mode: between calls, the bot's `on_step`
+is simply blocked waiting for the next snippet, so nothing about python-sc2's
+own stepping logic needed to change to get "the game pauses while you think"
+-- see `src/sdk/mcp_server.py`'s module docstring for the full
+concurrency/architecture writeup (same process, same asyncio event loop, no
+IPC: the MCP server and the running game are two tasks on one loop).
+
+Race-agnostic, same as `bot.*`/`sdk.*` themselves -- `sc2-sdk-mcp`'s CLI flags
+(`--race`, `--opponent-race`, `--difficulty`, `--map`) select which race you
+play. Run `sc2-sdk-mcp --help` for the full list. See
+`tests/integration/test_execute_code_mcp.py` for a full worked example,
+including the wiring test that confirms the game is genuinely paused/stepped
+(not free-running) between calls.
+
 ## Tests
 
 ```bash
@@ -196,7 +239,6 @@ runners.
 
 ## What's out of scope here
 
-Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): per-race macro
-helpers beyond the Terran acceptance tests (Protoss/Zerg -- #4/#5), the MCP
-server (#6), the standalone bot-script runtime (#7), self-play, and AI Arena
-ladder integration. See issue #1 for the full phase breakdown.
+Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): the standalone
+bot-script runtime (#7), self-play, and AI Arena ladder integration. See
+issue #1 for the full phase breakdown.
