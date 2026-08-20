@@ -132,6 +132,28 @@ def maps_dir(base: Path) -> Path:
     return base / "Maps"
 
 
+def ensure_lowercase_maps_alias(base: Path) -> None:
+    """Work around a real, confirmed engine bug: the compiled SC2_x64 Linux
+    binary resolves the map file it's told to load through a hardcoded
+    lowercase 'maps' path internally, regardless of what path python-sc2's
+    own ``Map`` object reports on the Python side (which correctly finds the
+    capitalized 'Maps' directory). On a case-sensitive Linux filesystem this
+    means ``CreateGameError.InvalidMapPath`` at game-creation time even
+    though the map file genuinely exists -- both this project's own synced
+    maps and the headless package's own bundled ladder-map archive land
+    under 'Maps', not 'maps'.
+
+    Create a ``maps -> Maps`` symlink so both cases resolve to the same
+    content. A relative symlink (not absolute), so it stays correct if the
+    install directory is later moved. No-op if a ``maps`` entry already
+    exists or 'Maps' doesn't (nothing to alias).
+    """
+    upper = base / "Maps"
+    lower = base / "maps"
+    if upper.is_dir() and not lower.exists():
+        lower.symlink_to(upper.name)
+
+
 @dataclass(frozen=True)
 class Sc2Installation:
     path: Path

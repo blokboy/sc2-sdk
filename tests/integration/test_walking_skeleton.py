@@ -12,6 +12,7 @@ fake/mocked client.
 
 from __future__ import annotations
 
+import pytest
 from sc2.data import Difficulty, Race, Result
 
 # Generous safety cap (in in-game seconds) so a stuck client can't hang the
@@ -20,6 +21,7 @@ from sc2.data import Difficulty, Race, Result
 _SAFETY_TIME_LIMIT = 20 * 60
 
 
+@pytest.mark.integration
 def test_full_game_vs_builtin_ai_runs_to_completion_and_reports_result(sc2_game_harness):
     result = sc2_game_harness(
         map_name="AutomatonLE",
@@ -39,6 +41,7 @@ def test_full_game_vs_builtin_ai_runs_to_completion_and_reports_result(sc2_game_
     )
 
 
+@pytest.mark.integration
 def test_race_and_difficulty_are_respected_on_the_secondary_map(sc2_game_harness):
     """Exercises the harness with a different map/race/difficulty
     combination than the primary test, to prove those parameters actually

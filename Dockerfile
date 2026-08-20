@@ -32,13 +32,19 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir -e ".[dev]"
 
-COPY tests ./tests
-
 # Installs the headless SC2 client + fixed map pool (install.maps.DEFAULT_MAPS)
 # to the default Linux location (~/StarCraftII), baked into the image so the
 # integration suite needs no network access at test/container-run time.
 # This is the same `sc2-sdk-setup` a human runs on a bare Linux host --
 # nothing Docker-specific about how the client gets installed.
+#
+# Deliberately placed *before* `COPY tests` below: this step downloads and
+# extracts a ~4GB archive and is the most expensive layer in this image by
+# a wide margin, while test files change often during development. Keeping
+# it ahead of the tests layer means editing a test doesn't invalidate this
+# layer's cache and force a full re-download/re-extract.
 RUN sc2-sdk-setup
+
+COPY tests ./tests
 
 CMD ["pytest", "-m", "integration", "-v"]

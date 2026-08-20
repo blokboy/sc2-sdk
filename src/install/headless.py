@@ -22,7 +22,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from install.paths import Sc2Installation, has_valid_install, platform_name
+from install.paths import Sc2Installation, ensure_lowercase_maps_alias, has_valid_install, platform_name
 
 #: Latest headless package listed under "Linux Packages" in
 #: https://github.com/Blizzard/s2client-proto#downloads as of this writing.
@@ -141,6 +141,7 @@ def install_headless_linux(
     dest = (dest or DEFAULT_LINUX_INSTALL_DIR).expanduser()
 
     if not force and has_valid_install(dest, pf):
+        ensure_lowercase_maps_alias(dest)
         return Sc2Installation(path=dest, source="headless")
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -173,5 +174,7 @@ def install_headless_linux(
         raise HeadlessInstallError(
             f"Extraction to {dest} completed but no valid SC2 install (Versions/Base*/SC2_x64) was found there."
         )
+
+    ensure_lowercase_maps_alias(dest)
 
     return Sc2Installation(path=dest, source="headless")
