@@ -3,11 +3,13 @@
 An SDK that lets an LLM coding agent install, connect to, and play StarCraft II,
 built on [`python-sc2`](https://github.com/BurnySc2/python-sc2) (PyPI: `burnysc2`).
 
-This is the **walking skeleton** stage (ticket #2): client install/detection,
-map pool sync, and a raw connect-and-play script against the game's built-in
-AI. The verified `bot.*`/`sdk.*` action/observation API described in the
-[full spec](https://github.com/blokboy/sc2-sdk/issues/1) is built in
-[ticket #3](https://github.com/blokboy/sc2-sdk/issues/3) onward.
+Client install/detection and map pool sync (ticket #2) plus a raw
+connect-and-play script against the game's built-in AI are the walking
+skeleton. The verified `bot.*`/`sdk.*` action/observation API (ticket #3) is
+built on top of that -- see "Play a verified bot against the built-in AI"
+below. Per-race macro helpers (Protoss/Zerg), the MCP server, and the
+autonomous script runtime are later tickets; see the
+[full spec](https://github.com/blokboy/sc2-sdk/issues/1).
 
 ## Install
 
@@ -84,16 +86,65 @@ result = play_vs_builtin_ai(
 )
 ```
 
+## Play a verified bot against the built-in AI (ticket #3)
+
+`sdk.bot.VerifiedBotAI` is the base class for a real `BotAI` subclass whose
+`on_step` drives the SDK's verified `bot.*` action/observation API against a
+live game:
+
+```python
+from sc2.data import Race, Difficulty
+from sc2.ids.unit_typeid import UnitTypeId
+from sdk.bot import VerifiedBotAI
+from sdk.runtime import run_bot_vs_builtin_ai
+
+
+class MyBot(VerifiedBotAI):
+    async def on_step(self, iteration: int) -> None:
+        if iteration == 0:
+            outcome = await self.bot.train(UnitTypeId.SCV)
+            print(outcome)  # TrainOutcome(ok=True, effect_confirmed=True, ...)
+
+
+result = run_bot_vs_builtin_ai(MyBot(), my_race=Race.Terran, difficulty=Difficulty.Easy)
+```
+
+- **`bot.*`** (`sdk.bot.Bot`, reached via `self.bot` inside your `BotAI`
+  subclass): `observe()`, `train()`, `build()`, `research()`, `move()`,
+  `attack_move()`, `chat()`. Each write action re-observes real subsequent
+  game state (not just python-sc2's own optimistic local bookkeeping) before
+  reporting whether the intended effect actually occurred -- see the outcome
+  dataclasses in `sdk/outcomes.py` (`ok` / `effect_confirmed` / `error` /
+  `detail`) and `sdk/bot.py`'s module docstring for why that requires
+  advancing real simulation steps, not just checking return values.
+- **`sdk.*`** (reached via `self.sdk`, or directly as `self` inside your
+  `BotAI` subclass): raw passthrough to the underlying python-sc2 `BotAI`
+  instance -- `self.sdk.units`, `self.sdk.client.debug_all_resources()`,
+  etc. -- for anything the verified tier doesn't cover.
+- Race-agnostic: `Bot`/`VerifiedBotAI` work for any of the three races.
+  Ticket #3 only *exercises* this against Terran; #4/#5 build Protoss/Zerg
+  macro helpers on top of the same classes.
+- Match outcome (`Result.Victory`/`Defeat`/`Tie`) is captured in `on_end` and
+  surfaced via `bot.observe().match_result` (or `bot.match_result` directly)
+  once the game ends -- safe to call after `run_game()` returns, since the
+  bot instance you constructed is still the same live object.
+
+See `tests/integration/test_verified_bot_actions.py` for a full worked
+example, including how invalid actions (insufficient resources, illegal
+placement, an unknown unit tag) come back as clear `ok=False` errors instead
+of silently no-op'ing.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-`tests/conftest.py` defines this project's **one integration-test harness**
-(`sc2_game_harness`): it boots a real, local, headless SC2 game and asserts
-on real subsequent game state -- no mocking of `python-sc2`. Every later
-ticket's tests are expected to reuse this fixture.
+`tests/conftest.py` defines this project's integration-test harnesses:
+`sc2_game_harness` (the walking-skeleton `play_vs_builtin_ai`, ticket #2) and
+`sc2_verified_bot_harness` (`run_bot_vs_builtin_ai`, for driving a
+`VerifiedBotAI` subclass, ticket #3). Both boot a real, local, headless SC2
+game and assert on real subsequent game state -- no mocking of `python-sc2`.
 
 If no local SC2 install is found, integration tests **skip** (not fail) with
 a message pointing at `setup`. To actually run them, you need a real machine
@@ -145,7 +196,7 @@ runners.
 
 ## What's out of scope here
 
-Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): the `bot.*`
-verified-action API, `sdk.*` raw passthrough layer, the MCP server, the
-standalone bot-script runtime, self-play, and AI Arena ladder integration.
-See issue #1 for the full phase breakdown.
+Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): per-race macro
+helpers beyond the Terran acceptance tests (Protoss/Zerg -- #4/#5), the MCP
+server (#6), the standalone bot-script runtime (#7), self-play, and AI Arena
+ladder integration. See issue #1 for the full phase breakdown.

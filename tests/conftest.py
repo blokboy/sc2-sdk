@@ -53,3 +53,22 @@ def sc2_game_harness(sc2_install: Sc2Installation) -> Callable[..., Result]:
     from sdk.play import play_vs_builtin_ai
 
     return play_vs_builtin_ai
+
+
+@pytest.fixture(scope="session")
+def sc2_verified_bot_harness(sc2_install: Sc2Installation) -> Callable[..., Result]:
+    """Returns a callable with the same signature as
+    sdk.runtime.run_bot_vs_builtin_ai, bound to a confirmed-present local
+    install -- the harness for ticket #3's (and #4-#8's) verified `bot.*`/
+    `sdk.*` API, as opposed to `sc2_game_harness`'s trivial do-nothing
+    `_NullBot` walking skeleton.
+
+    Deliberately a *second* fixture rather than a change to
+    `sc2_game_harness`: that fixture and the walking-skeleton test it backs
+    are the already-proven #2/#9 path and ticket #3's brief asks not to
+    touch them. Any `BotAI` instance (typically a `sdk.bot.VerifiedBotAI`
+    subclass) can be handed to the returned callable.
+    """
+    from sdk.runtime import run_bot_vs_builtin_ai
+
+    return run_bot_vs_builtin_ai
