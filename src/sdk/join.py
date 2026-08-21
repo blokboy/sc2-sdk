@@ -149,6 +149,8 @@ from sc2.portconfig import Portconfig
 from sc2.protocol import ConnectionAlreadyClosedError
 from sc2.sc2process import SC2Process
 
+from sdk.matchcode import wait_for_joiner
+
 #: Same fixed test map this project's other harnesses default to.
 DEFAULT_MAP = "AutomatonLE"
 
@@ -234,27 +236,43 @@ async def _run_host_role(
     realtime: bool,
     game_time_limit: int | None,
     name: str | None = None,
+    join_timeout: float | None = None,
 ) -> Result:
     """The "host" role: this process's local SC2 client calls
     `RequestCreateGame` (defining the match/map/two participant slots),
     then joins it as one of those slots -- mirrors `sc2.main._host_game`,
     generalized to take an explicit `host_ip` for the join step, and
     designed to be runnable independently of any "join"-role process (i.e.
-    not paired via `asyncio.gather` in the same Python process)."""
+    not paired via `asyncio.gather` in the same Python process).
+
+    `join_timeout`, if given, bounds only the "wait for a peer" phase
+    (`create_game`+`join_game` -- see `sdk.matchcode.wait_for_joiner`'s
+    docstring for why that's the one call that actually blocks on the
+    peer's engine handshake), not the match itself once both sides have
+    connected. `None` (default) preserves ticket #11's original untimed
+    behavior.
+    """
     async with SC2Process() as server:
         await server.ping()
-        # The second participant slot's race is a placeholder: per this
-        # module's docstring, RequestCreateGame's Participant slots don't
-        # carry a race at all -- each side's own join_game call decides its
-        # own race independently.
-        create_response = await server.create_game(
-            maps.get(map_name), [Bot(my_race, None), Bot(Race.Random, None)], realtime
-        )
-        if create_response.create_game.HasField("error"):
-            raise RuntimeError(f"Could not create game: {create_response.create_game}")
-
         client = Client(server._ws)
-        player_id = await _join_game_at(client, my_race, portconfig, host_ip, name=name)
+
+        async def _connect() -> int:
+            # The second participant slot's race is a placeholder: per this
+            # module's docstring, RequestCreateGame's Participant slots
+            # don't carry a race at all -- each side's own join_game call
+            # decides its own race independently.
+            create_response = await server.create_game(
+                maps.get(map_name), [Bot(my_race, None), Bot(Race.Random, None)], realtime
+            )
+            if create_response.create_game.HasField("error"):
+                raise RuntimeError(f"Could not create game: {create_response.create_game}")
+            return await _join_game_at(client, my_race, portconfig, host_ip, name=name)
+
+        if join_timeout is not None:
+            player_id = await wait_for_joiner(_connect(), timeout=join_timeout)
+        else:
+            player_id = await _connect()
+
         result = await _play_game_ai(client, player_id, bot_ai, realtime, game_time_limit)
         try:
             await client.leave()
@@ -272,15 +290,25 @@ async def _run_join_role(
     realtime: bool,
     game_time_limit: int | None,
     name: str | None = None,
+    join_timeout: float | None = None,
 ) -> Result:
     """The "join" role: this process's own local SC2 client (a second,
     independent `SC2Process` from the host's) joins the match the host
     already created, pointed at `host_ip` -- mirrors `sc2.main._join_game`,
-    generalized the same way as `_run_host_role` above."""
+    generalized the same way as `_run_host_role` above. `join_timeout` has
+    the same meaning as `_run_host_role`'s."""
     async with SC2Process() as server:
         await server.ping()
         client = Client(server._ws)
-        player_id = await _join_game_at(client, my_race, portconfig, host_ip, name=name)
+
+        async def _connect() -> int:
+            return await _join_game_at(client, my_race, portconfig, host_ip, name=name)
+
+        if join_timeout is not None:
+            player_id = await wait_for_joiner(_connect(), timeout=join_timeout)
+        else:
+            player_id = await _connect()
+
         result = await _play_game_ai(client, player_id, bot_ai, realtime, game_time_limit)
         try:
             await client.leave()

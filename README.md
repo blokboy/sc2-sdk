@@ -288,6 +288,53 @@ per side), not a single `Result` like `run_bot_vs_builtin_ai` -- that's
 `tests/integration/test_selfplay.py` for the wiring test confirming a real
 script, loaded twice, plays a full match against itself.
 
+## Play a 1v1 with another agent (ticket #12)
+
+Two participants, each on their own machine with their own local SC2
+client, play a real 1v1 -- each watching their own side render live on
+their own screen, exactly like a normal local game. One side **hosts**
+(picks the map, optionally pins the opponent's race, prints a shareable
+code) and the other **joins** using that code.
+
+```bash
+# Host side:
+sc2-sdk-host bots/idle_example.py --race terran --host-ip <address the joiner can reach you at>
+# Prints, e.g.: MATCH CODE: eyJob3N0X2lwIjoiMTAuMC4wLjUiLCA...
+
+# Join side (paste the code from the host):
+sc2-sdk-join <code> bots/idle_example.py --race zerg
+```
+
+- **Networking is not built or operated by this project.** `--host-ip` must
+  already be reachable from the joiner's machine -- same network, or a VPN/
+  tunnel you set up yourselves (e.g. Tailscale, ngrok). There is no relay or
+  NAT-traversal service; see the design discussion on
+  [issue #12](https://github.com/blokboy/sc2-sdk/issues/12) for why that's
+  a deliberate scope line, not an oversight.
+- **Both machines need the same map already synced** -- run `sc2-sdk-setup`
+  (see "Get a local SC2 client + map pool" above) on both sides first. The
+  underlying protocol resolves the map as a local file path independently
+  on each machine; there's no map-transfer step.
+- **Race conflicts:** if the host pins `--opponent-race-pin` and the joiner
+  also passes `--race`, the joiner's choice wins. Omit either to fall back
+  to the other's choice, or `Random` if neither is set.
+- **The host's `--timeout`** (default 300s) bounds how long it waits for a
+  joiner before giving up with a clear error, rather than hanging forever.
+- **The match code carries a token, but nothing checks it.** The raw SC2
+  join protocol has no authentication concept -- only network address and
+  port numbers, which the code already carries. The code's connection
+  details are themselves the actual shared secret; `token` is there for a
+  future rendezvous layer to check against, not enforced today. See
+  `sdk.matchcode`'s module docstring for the full reasoning.
+- Each side plays via the same `bots/<name>.py` script convention
+  `sc2-sdk-run-bot`/`sc2-sdk-selfplay` already use -- nothing new for *how*
+  a side plays, only for how the two already-local clients find each other.
+  Built directly on ticket #11's proven `host_ip`-aware join primitive
+  (`sdk.join`); see that module's docstring for what was empirically
+  confirmed about the underlying mechanism, and `sdk.matchcode`'s for the
+  shareable-code format. See `tests/integration/test_host_join_cli.py` for
+  the end-to-end wiring test (loopback, both roles as real subprocesses).
+
 ## Tests
 
 ```bash

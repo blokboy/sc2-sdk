@@ -87,6 +87,8 @@ MODULES: tuple[tuple[str, str], ...] = (
     ("sdk.selfplay", "src/sdk/selfplay.py"),
     ("sdk.mcp_server", "src/sdk/mcp_server.py"),
     ("sdk.join", "src/sdk/join.py"),
+    ("sdk.matchcode", "src/sdk/matchcode.py"),
+    ("sdk.host_join", "src/sdk/host_join.py"),
     ("install.cli", "src/install/cli.py"),
     ("install.battlenet", "src/install/battlenet.py"),
     ("install.headless", "src/install/headless.py"),

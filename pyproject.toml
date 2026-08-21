@@ -30,6 +30,8 @@ sc2-sdk-play = "sdk.play:main"
 sc2-sdk-mcp = "sdk.mcp_server:main"
 sc2-sdk-run-bot = "sdk.script_runner:main"
 sc2-sdk-selfplay = "sdk.selfplay:main"
+sc2-sdk-host = "sdk.host_join:main_host"
+sc2-sdk-join = "sdk.host_join:main_join"
 
 [build-system]
 requires = ["setuptools>=68"]
