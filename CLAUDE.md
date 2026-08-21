@@ -10,4 +10,4 @@ Default vocabulary — label strings match role names exactly (`needs-triage`, `
 
 ### Domain docs
 
-Multi-context layout — `CONTEXT-MAP.md` at the root points to per-context `CONTEXT.md` files (e.g. under `src/sdk/`, `src/bots/`, `src/install/` as those areas get built). See `docs/agents/domain.md`.
+Multi-context layout — `CONTEXT-MAP.md` at the root points to per-context `CONTEXT.md` files (e.g. under `src/sdk/`, `src/install/`, and root-level `bots/` as those areas get built). `bots/` was deliberately placed outside `src/` (ticket #7): it's where an agent adds its own standalone scripts, and keeping it out of `src/` means editing a bot script never invalidates the Dockerfile's expensive client-install layer, the same reasoning that already keeps `tests/` outside `src/`. See `docs/agents/domain.md`.

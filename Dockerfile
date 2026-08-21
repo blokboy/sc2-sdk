@@ -47,4 +47,9 @@ RUN sc2-sdk-setup
 
 COPY tests ./tests
 
+# Ticket #7's standalone bot-script convention (sdk.script_runner.BOTS_DIR)
+# resolves relative to this repo root at runtime, not through the installed
+# package -- so it needs its own COPY, same as tests above.
+COPY bots ./bots
+
 CMD ["pytest", "-m", "integration", "-v"]

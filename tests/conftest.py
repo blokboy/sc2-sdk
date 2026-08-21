@@ -72,3 +72,18 @@ def sc2_verified_bot_harness(sc2_install: Sc2Installation) -> Callable[..., Resu
     from sdk.runtime import run_bot_vs_builtin_ai
 
     return run_bot_vs_builtin_ai
+
+
+@pytest.fixture(scope="session")
+def sc2_bot_script_harness(sc2_install: Sc2Installation) -> Callable[..., Result]:
+    """Returns a callable with the same signature as
+    sdk.script_runner.run_bot_script, bound to a confirmed-present local
+    install -- the harness for ticket #7's standalone bot-script runtime:
+    discover a `BotAI` subclass at the documented `bots/<name>.py`
+    location, load it, and run it to completion via
+    `run_bot_vs_builtin_ai`/`sc2.main.run_game`, exactly like a real
+    unattended script run would.
+    """
+    from sdk.script_runner import run_bot_script
+
+    return run_bot_script

@@ -9,8 +9,11 @@ skeleton. The verified `bot.*`/`sdk.*` action/observation API (ticket #3) is
 built on top of that -- see "Play a verified bot against the built-in AI"
 below. Per-race macro helpers (Protoss/Zerg) extend the same API (#4/#5). The
 MCP `execute_code` interactive server (ticket #6) is built on top of all of
-that -- see "Play interactively via MCP" below. The autonomous script runtime
-is a later ticket; see the [full spec](https://github.com/blokboy/sc2-sdk/issues/1).
+that -- see "Play interactively via MCP" below. The autonomous bot-script
+runtime (ticket #7) is the third play modality, built on the same `bot.*`/
+`sdk.*` API -- see "Play an autonomous bot script" below. See the
+[full spec](https://github.com/blokboy/sc2-sdk/issues/1) for how all three
+fit together.
 
 ## Install
 
@@ -177,6 +180,60 @@ play. Run `sc2-sdk-mcp --help` for the full list. See
 including the wiring test that confirms the game is genuinely paused/stepped
 (not free-running) between calls.
 
+## Play an autonomous bot script (ticket #7)
+
+Where `execute_code` mode (#6) pauses the game every step waiting for the
+next externally-supplied snippet, this mode is the opposite: an agent
+authors a `BotAI` subclass **once**, as a normal Python file, and the SDK
+then plays a full game with it unattended -- no live per-tick calls from any
+caller once the game starts, optionally at full real-time speed against a
+real opponent.
+
+**Convention:** a standalone bot script is a `.py` file directly under the
+`bots/` directory at the repo root (`bots/<name>.py`), defining exactly one
+class that subclasses `sc2.bot_ai.BotAI` -- in practice `sdk.bot.VerifiedBotAI`,
+to get the same `bot.*`/`sdk.*` API surface `execute_code` mode uses. No
+fixed class name is required; the runner (`sdk.script_runner`) finds the one
+`BotAI` subclass a script *defines* (as opposed to merely imports, e.g.
+`VerifiedBotAI` itself) -- see `bots/idle_example.py` for a minimal worked
+example.
+
+```bash
+sc2-sdk-run-bot idle_example --race terran --opponent-race zerg
+```
+
+Runs `bots/idle_example.py` to completion at real-time speed by default and
+prints `RESULT: Victory|Defeat|Tie`. Pass `--no-realtime` to step as fast as
+the script responds instead (useful for CI). See `sc2-sdk-run-bot -h` for
+all options (map, race, opponent race, difficulty, `--time-limit`,
+`--bots-dir` to point at a different directory of scripts).
+
+Programmatically:
+
+```python
+from sc2.data import Race, Difficulty
+from sdk.script_runner import run_bot_script
+
+result = run_bot_script(
+    "idle_example",
+    my_race=Race.Terran,
+    opponent_race=Race.Zerg,
+    difficulty=Difficulty.Easy,
+)
+```
+
+`run_bot_script` discovers and loads the named script (`resolve_script_path`
++ `load_bot_class`), constructs an instance of the class it finds, and hands
+it straight to `runtime.run_bot_vs_builtin_ai` (the same synchronous
+`sc2.main.run_game` entrypoint ticket #3's tests use) -- so a script written
+against `self.bot`/`self.sdk` inside `on_step` behaves identically here and
+in `execute_code` mode; the only difference is who's calling `on_step` and
+how often. See `tests/integration/test_bot_script_runtime.py` for the
+wiring test confirming a real script at the documented location is
+discovered, loaded, and run, and `tests/test_script_runner.py` for the
+discovery/loading edge cases (missing script, zero/multiple `BotAI`
+subclasses in one file).
+
 ## Tests
 
 ```bash
@@ -239,6 +296,5 @@ runners.
 
 ## What's out of scope here
 
-Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): the standalone
-bot-script runtime (#7), self-play, and AI Arena ladder integration. See
-issue #1 for the full phase breakdown.
+Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): self-play and
+AI Arena ladder integration. See issue #1 for the full phase breakdown.
