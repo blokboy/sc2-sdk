@@ -41,6 +41,7 @@ things), see the root [`README.md`](../README.md) and
 - [`sdk.script_runner`](#sdkscriptrunner)
 - [`sdk.selfplay`](#sdkselfplay)
 - [`sdk.mcp_server`](#sdkmcpserver)
+- [`sdk.join`](#sdkjoin)
 - [`install.cli`](#installcli)
 - [`install.battlenet`](#installbattlenet)
 - [`install.headless`](#installheadless)
@@ -975,6 +976,203 @@ def main(argv: list[str] | None=None) -> None
 Console-script entrypoint (`sc2-sdk-mcp`, see pyproject.toml):
 launch a real game against the built-in AI and serve `execute_code`
 over stdio for a real MCP client (e.g. an LLM coding agent) to drive.
+
+## `sdk.join`
+
+*Source: [`src/sdk/join.py`](../src/sdk/join.py)*
+
+Ticket #11 (https://github.com/blokboy/sc2-sdk/issues/11): proof that the
+SC2 engine's own join-game handshake works when a "join"-role client is
+pointed at an explicit host address+port, instead of relying on
+`sc2.main.run_game`'s single-call, single-process orchestration of both
+sides. This is the foundational risk check underneath the planned host/join
+1v1 feature (see the sibling "Host/join 1v1" ticket): if the primitive
+proven here didn't work, that ticket's design would need to change before
+being built.
+
+What was actually confirmed
+----------------------------
+Reading python-sc2's `sc2/main.py` shows that `run_game()`'s Bot-vs-Bot path
+(`sum(isinstance(p, (Human, Bot)) ...) > 1`) is *already* two independent
+coroutines, `_host_game` and `_join_game`, that only happen to be scheduled
+together via a single `asyncio.gather(...)` inside one `asyncio.run()` call.
+Each one launches its own `SC2Process` (a genuinely separate OS child
+process -- see `sc2/sc2process.py`) and only ever talks to *that* local
+client over its own private loopback websocket (the "API port", e.g.
+`ws://127.0.0.1:<picked-port>/sc2api`); the two SC2 engines themselves then
+find each other over a *second*, independent set of ports (`Portconfig`,
+below) using the game's own LAN networking, not the API websocket. That
+second channel is where cross-machine join would have to happen, and
+`s2clientprotocol.sc2api_pb2.RequestJoinGame` does carry the field for it:
+
+    optional string host_ip = 8;  // Both game creator and joiner should
+    // provide the ip address of the game creator in order to play
+    // remotely. Defaults to localhost.
+
+(comment copied verbatim from Blizzard/s2client-proto's `sc2api.proto`).
+`sc2.client.Client.join_game()` builds a `RequestJoinGame` but never sets
+`host_ip` -- there's no public python-sc2 API to reach it. `_join_game_at`
+below fills that gap by constructing the same request `Client.join_game()`
+would, plus `host_ip`, and executing it directly.
+
+So: the primitive works as hoped, generalizes cleanly beyond `run_game`, and
+required no protocol-level surgery -- just exposing one already-defined
+proto field python-sc2 doesn't surface. Confirmed empirically, twice, in a
+real (QEMU-emulated x86_64, per this repo's Docker path) headless Linux SC2
+install: (1) `host_ip="127.0.0.1"` on both sides -- `run_join_game_match`
+below, launched as two real `python -m sdk.join` OS processes with no
+shared asyncio loop -- reaches a real match `Result` on both sides in
+~3.75 minutes wall-clock for a 20-minute in-game safety cap; (2) as a
+negative control, pointing the host side's `host_ip` at an unreachable
+address (`10.255.255.1`) instead of `127.0.0.1` makes the host's own
+`join_game` call hang indefinitely (it times out under
+`run_join_game_match`'s `process_timeout`, never printing a `Result`) --
+proving `host_ip` is actually load-bearing for the handshake, not a field
+python-sc2/the engine silently ignores. `Portconfig.as_json`/`.from_json`
+(see `sc2/portconfig.py`) already exist for exactly this cross-process
+scenario -- they're what the AI-Arena/sc2ai ladder ecosystem's `BotProcess`
+convention (`--LadderServer`/`--GamePort`/`--StartPort`, see `sc2/player.py`)
+uses to hand identical port assignments to independently-launched bot
+processes. That's strong independent evidence this exact split (one
+process per side, ports agreed out of band) is a first-class, intended use
+of the underlying API, not something being bent to a new purpose.
+
+Surprises vs. the design assumption
+------------------------------------
+- `RequestCreateGame`'s player_setup for `Participant` slots (as opposed to
+  `Computer`) carries no `race` field at all (see `sc2.controller.
+  Controller.create_game`) -- race is only decided per side, at join time,
+  in each side's own `RequestJoinGame.race`. So the host process does not
+  need to know the joining side's race up front; the two sides are more
+  independent than a first reading of `run_game`'s single `players` list
+  suggests.
+- `join_game`'s websocket round-trip (`Protocol._execute`) returns only
+  once, well after the request is sent, with no separate "waiting for
+  peer" signal in between -- i.e. the local engine's response to
+  `RequestJoinGame` blocks until the actual LAN handshake with the peer
+  engine resolves. That's *why* `run_game`'s existing Bot-vs-Bot path gets
+  away with zero manual synchronization between `_host_game` and
+  `_join_game` beyond starting both concurrently: the ordering/retry logic
+  already lives inside the SC2 engines' own networking, invisible to the
+  Python driving code. Splitting the two roles into genuinely separate OS
+  processes below relies on that exact same engine-level behavior, which is
+  indifferent to whether the two callers are asyncio tasks in one process
+  or two unrelated `python -m sdk.join` invocations -- the engines only
+  ever see socket traffic, never Python call stacks.
+- Threads (each with their own asyncio loop, one option this ticket's brief
+  allowed) turn out not to work cleanly here: `SC2Process.__aenter__`
+  unconditionally calls `signal.signal(signal.SIGINT, ...)`
+  (`sc2/sc2process.py`), and Python only allows `signal.signal()` from the
+  interpreter's main thread. Launching a second `SC2Process` from a
+  background thread raises `ValueError: signal only works in main thread of
+  the main interpreter`. Real subprocesses (used below) sidestep this
+  entirely -- each child's `SC2Process` runs on the main thread of its own
+  process -- and match "two independent processes" more literally anyway.
+
+What would differ for a genuinely remote (non-loopback) address
+------------------------------------------------------------------
+Not tested here (out of scope per the ticket), but reasoning from the
+above:
+  - `host_ip` would need to be the host machine's real routable address
+    (LAN IP, or a tunnel/VPN endpoint), and the `Portconfig` ports (4 TCP
+    ports: `server` pair + one `players` pair per guest) would need to be
+    reachable from the joining machine -- i.e. open through any firewall
+    and NAT'd/forwarded if the host isn't on a public or VPN-shared
+    address. This is exactly the same requirement Blizzard's own ladder
+    infrastructure (AI-Arena/sc2ai) documents for `BotProcess`-style
+    external matches.
+  - `RequestCreateGame.local_map` is a *local* filesystem path resolved
+    independently by each engine (see `Controller.create_game`) -- there is
+    no map-transfer step in this protocol. Both machines need the identical
+    map file already present locally (this project's `install.maps` sync
+    step handles that today, but only within one machine's install; a real
+    host/join feature would need to guarantee both sides' map pools agree,
+    e.g. by shipping/verifying the same fixed map pool on both sides rather
+    than assuming it).
+  - Nothing else in this module is loopback-specific: `host_ip` is a plain
+    string passed straight into the proto request, so a real address would
+    flow through unchanged -- the mechanism itself does not need to change,
+    only what's on the other end of it.
+
+Design of this module
+----------------------
+`_run_host_role`/`_run_join_role` are standalone coroutines, each just a
+`SC2Process` + our own `host_ip`-aware join + python-sc2's own
+`sc2.main._play_game_ai` step loop (reused as-is, unmodified, the same way
+`sdk.mcp_server` already reaches into `sc2.main._host_game` for a
+structural reason the public API doesn't cover -- see that module's
+docstring for the precedent). `python -m sdk.join --role host|join ...`
+(the `main()` below) is a thin CLI wrapper around each, so
+`run_join_game_match()` can launch host and join as two real,
+independently-scheduled OS processes (`subprocess.Popen`, not
+`asyncio.gather` in one process) and still recover each side's `Result`.
+This is deliberately a new, separate module rather than a change to
+`sdk.play`/`sdk.runtime`: those launch python-sc2's `run_game()` directly
+and this ticket's brief asks not to touch them.
+
+### `DEFAULT_MAP`
+
+```python
+DEFAULT_MAP = 'AutomatonLE'
+```
+
+Same fixed test map this project's other harnesses default to.
+
+### `DEFAULT_HOST_IP`
+
+```python
+DEFAULT_HOST_IP = '127.0.0.1'
+```
+
+Loopback proof only (see this module's docstring) -- the ticket's own acceptance criteria call out that real network/NAT traversal is out of scope, only that the *mechanism* (an explicit host_ip) generalizes.
+
+### `run_join_game_match`
+
+```python
+def run_join_game_match(map_name: str=DEFAULT_MAP, host_race: Race=Race.Terran, join_race: Race=Race.Zerg, host_ip: str=DEFAULT_HOST_IP, realtime: bool=False, game_time_limit: int | None=None, process_timeout: float=600.0) -> tuple[Result, Result]
+```
+
+Launch a host-role and a join-role SC2 client as two independent,
+concurrently-running OS processes (`python -m sdk.join`, see `main()`
+below) and run one real 2-player match to completion between them.
+
+This is the demoable code path the ticket asks for: unlike
+`sdk.play.play_vs_builtin_ai`/`sdk.runtime.run_bot_vs_builtin_ai`
+(both of which call python-sc2's `run_game()`, which spawns and wires
+up both sides itself from one call), the two sides here are started as
+two separate `subprocess.Popen` invocations. Neither process's asyncio
+loop is aware the other exists as anything but "some peer reachable at
+`host_ip` + the ports in `portconfig`" -- the same information a
+genuinely different machine's join-role process would need.
+
+Args:
+    map_name: name of a synced map (see install.maps.DEFAULT_MAPS),
+        resolved independently by each subprocess's own SC2 install.
+    host_race: race the host-role side plays.
+    join_race: race the join-role side plays.
+    host_ip: address the join side is told to connect to, and the host
+        side is told it's reachable at. `127.0.0.1` (default) proves
+        the mechanism on one machine; see this module's docstring for
+        what would need to hold for a genuinely remote address.
+    realtime: if False (default), each side steps only as fast as its
+        (trivial) bot responds.
+    game_time_limit: optional wall-clock-independent safety cap, in
+        in-game seconds, passed to both sides.
+    process_timeout: wall-clock safety cap, in seconds, for each
+        subprocess -- distinct from `game_time_limit` (which caps
+        *in-game* time and is enforced by python-sc2 itself); this one
+        guards against a subprocess never starting/connecting at all.
+
+Returns:
+    (host_result, join_result) -- each side's own `sc2.data.Result` for
+    the match, exactly as each side's own `_play_game_ai` call
+    observed it.
+
+### `main`
+
+```python
+def main(argv: list[str] | None=None) -> int
+```
 
 ## `install.cli`
 
