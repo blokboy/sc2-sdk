@@ -1,3 +1,8 @@
+## Getting set up
+
+See `AGENTS.md` first -- it's the canonical get-running/confirm-connected
+sequence for a fresh clone. Don't re-derive it from here or from README.md.
+
 ## Agent skills
 
 ### Issue tracker
