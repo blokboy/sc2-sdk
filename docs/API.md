@@ -39,6 +39,7 @@ things), see the root [`README.md`](../README.md) and
 - [`sdk.play`](#sdkplay)
 - [`sdk.runtime`](#sdkruntime)
 - [`sdk.script_runner`](#sdkscriptrunner)
+- [`sdk.selfplay`](#sdkselfplay)
 - [`sdk.mcp_server`](#sdkmcpserver)
 - [`install.cli`](#installcli)
 - [`install.battlenet`](#installbattlenet)
@@ -541,6 +542,52 @@ Returns:
     sc2.data.Result -- one of Victory, Defeat, Tie, or (in edge cases
     python-sc2 itself reports, e.g. a crashed client) Undecided.
 
+### `run_bot_vs_bot`
+
+```python
+def run_bot_vs_bot(bot_a: BotAI, bot_b: BotAI, map_name: str=DEFAULT_MAP, race_a: Race=Race.Terran, race_b: Race=Race.Terran, realtime: bool=False, game_time_limit: int | None=None) -> list[Result]
+```
+
+Launch a full local match between two `BotAI` instances -- ticket
+#10's self-play mode -- and run it to completion. Both objects are still
+live and inspectable afterward, same as `run_bot_vs_builtin_ai`'s
+`bot_ai` argument.
+
+This is a sibling to `run_bot_vs_builtin_ai`, not a variant of it with an
+`if opponent_is_a_bot` branch: `run_game` itself returns a *different
+shape* depending on whether the second player is a `Computer` or another
+`Bot` (see `sc2.main.run_game`'s own docstring -- a single `Result` for
+vs-Computer, a `list` of two `Result`s for Bot-vs-Bot/Bot-vs-Human,
+because that path actually spawns and hosts/joins two local SC2
+processes rather than one client playing against the built-in AI
+in-process). Folding both shapes behind one return type would either
+lose information (always returning one `Result`) or force every existing
+`run_bot_vs_builtin_ai` caller to start handling a list -- neither of
+which this ticket's brief asks for.
+
+Args:
+    bot_a: a constructed `BotAI` (usually `VerifiedBotAI`) instance for
+        the first side.
+    bot_b: a constructed `BotAI` instance for the second side. Pass a
+        second, separate instance of the same class as `bot_a` to play a
+        script against itself (what `sc2-sdk-selfplay` does when given
+        only one script), or a different class entirely for two
+        different bots.
+    map_name: see `run_bot_vs_builtin_ai`.
+    race_a: the race `bot_a` plays. Defaults to Terran for the same
+        reason `run_bot_vs_builtin_ai.my_race` does -- pass explicitly
+        for Protoss/Zerg bots.
+    race_b: the race `bot_b` plays.
+    realtime: if False (default), the game steps only as fast as both
+        bots respond -- deterministic and fast for tests, consistent
+        with `run_bot_vs_builtin_ai`'s default.
+    game_time_limit: see `run_bot_vs_builtin_ai`.
+
+Returns:
+    A two-element list of `sc2.data.Result`, `[result_for_bot_a,
+    result_for_bot_b]` -- `run_game`'s own shape for a non-Computer
+    match, passed through as-is rather than collapsed to one value.
+
 ## `sdk.script_runner`
 
 *Source: [`src/sdk/script_runner.py`](../src/sdk/script_runner.py)*
@@ -653,6 +700,67 @@ Args:
 
 Returns:
     sc2.data.Result -- see `runtime.run_bot_vs_builtin_ai`.
+
+### `main`
+
+```python
+def main(argv: list[str] | None=None) -> int
+```
+
+## `sdk.selfplay`
+
+*Source: [`src/sdk/selfplay.py`](../src/sdk/selfplay.py)*
+
+Self-play mode -- ticket #10
+(https://github.com/blokboy/sc2-sdk/issues/10): run a standalone bot script
+(see `sdk.script_runner`'s module docstring for the `bots/<name>.py`
+convention) against a second instance of itself, or against a *different*
+bot script, in a single local match -- no human, no built-in AI, on either
+side.
+
+Deliberately its own module rather than an option bolted onto
+`sdk.script_runner`: that module's `run_bot_script`/`main` are the proven
+#7 vs-built-in-AI path, and this ticket's brief asks not to touch that
+existing single-bot behavior. What *is* shared is the discovery mechanics
+(`resolve_script_path`, `load_bot_class`) -- those were already plain,
+dependency-free functions in `script_runner`, so this module imports and
+reuses them directly rather than duplicating "find the one BotAI subclass a
+script defines" a second time. The only genuinely new piece is
+`runtime.run_bot_vs_bot` (two `Bot` players instead of one `Bot` + one
+`Computer`) and the CLI wiring around loading *two* scripts instead of one.
+
+### `run_bot_selfplay`
+
+```python
+def run_bot_selfplay(bot_a_name_or_path: str, bot_b_name_or_path: str | None=None, map_name: str=DEFAULT_MAP, race_a: Race=Race.Terran, race_b: Race=Race.Terran, realtime: bool=False, game_time_limit: int | None=None, bots_dir: Path=BOTS_DIR) -> list[Result]
+```
+
+Discover, load, and run one or two standalone bot scripts against
+each other to completion via `runtime.run_bot_vs_bot`.
+
+Args:
+    bot_a_name_or_path: a bot name under `bots_dir`, or a literal path
+        to a `.py` file -- same resolution rule as
+        `script_runner.run_bot_script`.
+    bot_b_name_or_path: same, for the second side. If omitted (the
+        default), `bot_a_name_or_path` is loaded *twice* -- a fresh,
+        separate instance of the same discovered class for each side --
+        so a script plays against itself.
+    map_name, race_a, race_b, game_time_limit: see
+        `runtime.run_bot_vs_bot`.
+    realtime: if False (default), the game steps only as fast as both
+        bots respond -- fast/deterministic, matching
+        `runtime.run_bot_vs_bot`'s own default (unlike
+        `script_runner.run_bot_script`, which defaults to real-time
+        since unattended single-script play is its whole point; here,
+        fast local iteration is the more useful default for two bots
+        testing against each other).
+    bots_dir: override for where bot names resolve against; see
+        `script_runner.run_bot_script`.
+
+Returns:
+    `[result_for_bot_a, result_for_bot_b]` -- see
+    `runtime.run_bot_vs_bot`.
 
 ### `main`
 

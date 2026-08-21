@@ -234,6 +234,60 @@ discovered, loaded, and run, and `tests/test_script_runner.py` for the
 discovery/loading edge cases (missing script, zero/multiple `BotAI`
 subclasses in one file).
 
+## Play self-play (ticket #10)
+
+Two `BotAI` instances play each other directly -- no human, no built-in AI,
+on either side. This reuses the same local two-client mechanism
+`python-sc2`'s `run_game` already uses for Bot-vs-Bot, exposed through the
+same layering as every other play modality here: a library primitive
+(`sdk.runtime.run_bot_vs_bot`) plus a thin CLI wrapper
+(`sc2-sdk-selfplay`).
+
+```bash
+# A script against a second instance of itself:
+sc2-sdk-selfplay bots/idle_example.py
+
+# Two different scripts against each other:
+sc2-sdk-selfplay bots/idle_example.py bots/another_bot.py
+```
+
+Both forms reuse `sc2-sdk-run-bot`'s exact discovery convention
+(`resolve_script_path` + `load_bot_class` from `sdk.script_runner`): a bare
+name resolves to `bots/<name>.py`, or pass a literal `.py` path directly.
+Runs stepped (`--no-realtime`'s *opposite* is the default here, unlike
+`sc2-sdk-run-bot`) -- fast/deterministic iteration is the more useful
+default when both sides are scripts under test rather than one side playing
+unattended in real time; pass `--realtime` to run at wall-clock speed
+instead. See `sc2-sdk-selfplay -h` for all options (map, `--race-a`/
+`--race-b`, `--time-limit`, `--bots-dir`).
+
+Programmatically, drive two already-constructed `BotAI` instances directly
+with the runtime primitive (no script-loading involved -- pair it with
+`sdk.script_runner.load_bot_class`/`resolve_script_path` if you're starting
+from a `bots/<name>.py` file, exactly like `sc2-sdk-selfplay` does
+internally):
+
+```python
+from sc2.data import Race
+from sdk.runtime import run_bot_vs_bot
+from sdk.script_runner import load_bot_class, resolve_script_path
+
+BotClass = load_bot_class(resolve_script_path("idle_example"))
+result_a, result_b = run_bot_vs_bot(
+    BotClass(),
+    BotClass(),
+    race_a=Race.Terran,
+    race_b=Race.Terran,
+)
+```
+
+`run_bot_vs_bot` returns a **two-element list** of `sc2.data.Result` (one
+per side), not a single `Result` like `run_bot_vs_builtin_ai` -- that's
+`run_game`'s own return shape for a non-Computer match (see
+`sdk.runtime.run_bot_vs_bot`'s docstring), passed through as-is. See
+`tests/integration/test_selfplay.py` for the wiring test confirming a real
+script, loaded twice, plays a full match against itself.
+
 ## Tests
 
 ```bash
