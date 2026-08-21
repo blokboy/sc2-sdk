@@ -294,6 +294,36 @@ A GitHub Actions workflow (`.github/workflows/integration.yml`) builds this
 same image and runs the integration suite on every push/PR, on x86_64
 runners.
 
+## API reference (ticket #8)
+
+[`docs/API.md`](docs/API.md) is a generated reference of every public
+`bot.*`/`sdk.*`/`install.*` class, function, and constant this project
+defines -- produced from the actual source (via `scripts/gen_api_docs.py`,
+which walks it with Python's `ast`), not hand-maintained prose, so it can't
+silently drift out of sync with the real API surface. Regenerate it after
+changing a documented module's public surface:
+
+```bash
+python scripts/gen_api_docs.py
+```
+
+`python scripts/gen_api_docs.py --check` (what
+`.github/workflows/docs.yml` runs on every push/PR) fails loudly instead of
+writing the file if `docs/API.md` doesn't match what the current source
+would produce. This check is pure static analysis over this repo's own
+Python source -- no SC2 client, no Docker, not even this project's runtime
+dependencies installed -- so it's a separate, fast workflow from
+`.github/workflows/integration.yml`'s real-game Docker build.
+
+## Learnings / example scripts (ticket #8)
+
+[`learnings/README.md`](learnings/README.md) has copyable, worked examples
+of using `bot.*` for real things, starting with a continuous Terran macro
+loop (`learnings/macro_loop_bot.py`) that trains workers, expands supply,
+and builds a Barracks to start training Marines -- a different shape from
+`bots/idle_example.py`'s one-shot action, meant as a starting point to copy
+and adapt rather than documentation of the `bots/` convention itself.
+
 ## What's out of scope here
 
 Per the [spec](https://github.com/blokboy/sc2-sdk/issues/1): self-play and

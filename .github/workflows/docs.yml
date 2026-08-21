@@ -1,0 +1,40 @@
+name: API docs (generated, no SC2 client needed)
+
+# Ticket #8: docs/API.md is generated from the SDK's actual public
+# bot.*/sdk.*/install.* surface (see ../../scripts/gen_api_docs.py), not
+# hand-maintained. This job proves it hasn't drifted: it regenerates the
+# file fresh from source and diffs it against what's committed, failing
+# loudly if they differ -- same "build once, verify once, fail loudly"
+# shape as ../../.github/workflows/integration.yml's real-game check, just
+# for docs instead of gameplay.
+#
+# Deliberately its own workflow, separate from integration.yml: the
+# generator is pure static analysis over this repo's own Python source (see
+# scripts/gen_api_docs.py's module docstring for why it's AST-based rather
+# than import+inspect) -- it needs no SC2 client, no Docker, not even this
+# project's own runtime dependencies installed. A docs-only PR should not
+# have to wait on integration.yml's ~10GB Docker build to get a green check.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  api-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned (not "3.x") so this job's own runs stay self-consistent:
+          # ast.unparse's exact formatting can differ slightly across Python
+          # minor versions in edge cases, and this check's determinism
+          # guarantee only needs same-version reproducibility, not
+          # cross-version reproducibility -- see the generator's module
+          # docstring.
+          python-version: "3.12"
+
+      - name: Check docs/API.md is up to date with the actual source
+        run: python scripts/gen_api_docs.py --check
