@@ -84,6 +84,7 @@ MODULES: tuple[tuple[str, str], ...] = (
     ("sdk.play", "src/sdk/play.py"),
     ("sdk.runtime", "src/sdk/runtime.py"),
     ("sdk.script_runner", "src/sdk/script_runner.py"),
+    ("sdk.selfplay", "src/sdk/selfplay.py"),
     ("sdk.mcp_server", "src/sdk/mcp_server.py"),
     ("install.cli", "src/install/cli.py"),
     ("install.battlenet", "src/install/battlenet.py"),

@@ -87,3 +87,22 @@ def sc2_bot_script_harness(sc2_install: Sc2Installation) -> Callable[..., Result
     from sdk.script_runner import run_bot_script
 
     return run_bot_script
+
+
+@pytest.fixture(scope="session")
+def sc2_selfplay_harness(sc2_install: Sc2Installation) -> Callable[..., list[Result]]:
+    """Returns a callable with the same signature as
+    sdk.runtime.run_bot_vs_bot, bound to a confirmed-present local install --
+    the harness for ticket #10's self-play mode: two `BotAI` instances
+    (potentially two instances of the same class) playing each other
+    directly, rather than either side facing the built-in AI.
+
+    Deliberately a *new* fixture, not a change to `sc2_verified_bot_harness`:
+    `run_bot_vs_bot` returns a two-element list of `Result` (one per side),
+    not the single `Result` every other harness here returns -- a different
+    enough shape that folding it into an existing fixture would be
+    surprising for callers of those fixtures.
+    """
+    from sdk.runtime import run_bot_vs_bot
+
+    return run_bot_vs_bot

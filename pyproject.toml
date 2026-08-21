@@ -29,6 +29,7 @@ sc2-sdk-setup = "install.cli:main"
 sc2-sdk-play = "sdk.play:main"
 sc2-sdk-mcp = "sdk.mcp_server:main"
 sc2-sdk-run-bot = "sdk.script_runner:main"
+sc2-sdk-selfplay = "sdk.selfplay:main"
 
 [build-system]
 requires = ["setuptools>=68"]
