@@ -1,8 +1,11 @@
 """MCP `execute_code` interactive mode -- ticket #6
 (https://github.com/blokboy/sc2-sdk/issues/6): an MCP server exposing a
 single `execute_code` tool that evaluates a Python snippet against live
-`bot`/`sdk` globals bound to a running game, with the game paused between
-calls rather than advancing on wall-clock time.
+`bot`/`sdk` globals bound to a running game. By default the game is paused
+between calls rather than advancing on wall-clock time; pass
+`realtime=True` (`--realtime` on the CLI) to run it at wall-clock speed
+instead, e.g. for a human spectating the rendered client live -- see
+`_build_session`'s docstring for what that does and doesn't change.
 
 Concurrency/communication design
 ---------------------------------
@@ -303,18 +306,63 @@ def build_server(bot_ai: ExecuteCodeBotAI, name: str = "sc2-sdk") -> FastMCP:
     return mcp
 
 
+def _build_session(
+    map_name: str = DEFAULT_MAP,
+    my_race: Race = Race.Terran,
+    opponent_race: Race = Race.Random,
+    difficulty: Difficulty = Difficulty.Easy,
+    game_time_limit: int | None = None,
+    realtime: bool = False,
+) -> ExecuteCodeSession:
+    """Build the `FastMCP` server and kick off the game task, returning as
+    soon as both exist -- deliberately *not* waiting for `bot_ai.ready`
+    (contrast `serve_execute_code` below). `main()` uses this directly so
+    stdio serving (and therefore a real client's `initialize()` handshake)
+    starts immediately instead of stalling for however long the real SC2
+    client takes to launch and load into a match -- `execute_code` itself
+    already awaits `bot_ai.ready` per-call (see `build_server`), so nothing
+    about correctness depends on waiting here too.
+
+    `realtime` defaults to `False` (this ticket's original design: the game
+    only advances one internal step per `execute_code` call -- see module
+    docstring). Passing `True` instead lets the game run at wall-clock
+    speed between calls -- `on_step`'s blocking `queue.get()` (see
+    `ExecuteCodeBotAI`) still gates when *this bot's own* decisions get
+    made, but the underlying SC2 engine no longer waits on that to keep
+    simulating, so play looks and feels live instead of frozen between
+    calls. Useful for a human spectating the rendered client; the
+    still-paused default remains what the wiring test below verifies."""
+    bot_ai = ExecuteCodeBotAI()
+    mcp = build_server(bot_ai)
+
+    game_task = asyncio.create_task(
+        _host_game(
+            maps.get(map_name),
+            [Sc2BotPlayer(my_race, bot_ai), Computer(opponent_race, difficulty)],
+            realtime=realtime,
+            game_time_limit=game_time_limit,
+        )
+    )
+    bot_ai.game_task = game_task
+
+    return ExecuteCodeSession(mcp=mcp, bot_ai=bot_ai, game_task=game_task)
+
+
 async def serve_execute_code(
     map_name: str = DEFAULT_MAP,
     my_race: Race = Race.Terran,
     opponent_race: Race = Race.Random,
     difficulty: Difficulty = Difficulty.Easy,
     game_time_limit: int | None = None,
+    realtime: bool = False,
 ) -> ExecuteCodeSession:
-    """Launch a real game against the built-in AI (non-realtime, i.e.
-    stepped mode -- always; there is no realtime option here, since
-    stepped-between-calls is the entire point of this ticket) and return an
-    `ExecuteCodeSession` wrapping a `FastMCP` server whose `execute_code`
-    tool is live against it.
+    """Launch a real game against the built-in AI -- stepped (paused
+    between calls) by default, or wall-clock speed if `realtime=True`, see
+    `_build_session` -- and return an `ExecuteCodeSession` wrapping a
+    `FastMCP` server whose `execute_code` tool is live against it, once the
+    game has actually loaded and is ready for calls -- callers that need a
+    session back only once it's fully live (e.g. the wiring test below)
+    should use this; `main()` does not, see `_build_session`.
 
     Does not itself serve any transport -- callers decide that. The
     console-script entrypoint (`main()` below) serves it over stdio, the
@@ -326,21 +374,16 @@ async def serve_execute_code(
     piped through a subprocess's stdio, since the whole point under test is
     the same-event-loop pause/step wiring, not stdio framing.
     """
-    bot_ai = ExecuteCodeBotAI()
-    mcp = build_server(bot_ai)
-
-    game_task = asyncio.create_task(
-        _host_game(
-            maps.get(map_name),
-            [Sc2BotPlayer(my_race, bot_ai), Computer(opponent_race, difficulty)],
-            realtime=False,
-            game_time_limit=game_time_limit,
-        )
+    session = _build_session(
+        map_name=map_name,
+        my_race=my_race,
+        opponent_race=opponent_race,
+        difficulty=difficulty,
+        game_time_limit=game_time_limit,
+        realtime=realtime,
     )
-    bot_ai.game_task = game_task
-
-    await bot_ai.ready.wait()
-    return ExecuteCodeSession(mcp=mcp, bot_ai=bot_ai, game_task=game_task)
+    await session.bot_ai.ready.wait()
+    return session
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -369,16 +412,29 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help="In-game-second safety cap; the match is scored a Tie if unresolved by then.",
     )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help=(
+            "Run the game at wall-clock speed between execute_code calls instead of the "
+            "default stepped/paused mode -- see _build_session's docstring. Useful when "
+            "spectating the rendered client live."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    session = await serve_execute_code(
+    # Uses _build_session, not serve_execute_code: a real client's stdio
+    # handshake must not have to outlast the real SC2 client's launch time
+    # -- see _build_session's docstring.
+    session = _build_session(
         map_name=args.map,
         my_race=_RACE_BY_NAME[args.race],
         opponent_race=_RACE_BY_NAME[args.opponent_race],
         difficulty=_DIFFICULTY_BY_NAME[args.difficulty],
         game_time_limit=args.time_limit,
+        realtime=args.realtime,
     )
     await session.mcp.run_stdio_async()
 

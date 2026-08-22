@@ -31,6 +31,7 @@ import sys
 from sc2.data import Race
 from sc2.portconfig import Portconfig
 
+from install.tailscale import detect_tailscale_ip, prompt_for_tailscale_install
 from sdk.join import _run_host_role, _run_join_role
 from sdk.matchcode import JoinTimeoutError, decode_match_code, encode_match_code, resolve_race
 from sdk.script_runner import load_bot_class, resolve_script_path
@@ -59,9 +60,10 @@ def _parse_host_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host-ip",
-        required=True,
+        default=None,
         help="Address the joiner's machine can reach this host at (e.g. a Tailscale/VPN address). "
-        "Not auto-detected -- this project doesn't operate any relay/NAT-traversal, see README.",
+        "Omit to auto-detect (or get guided through installing) a Tailscale IP -- see "
+        "install.tailscale. This project doesn't operate any relay/NAT-traversal itself, see README.",
     )
     parser.add_argument(
         "--timeout",
@@ -96,11 +98,21 @@ def main_host(argv: list[str] | None = None) -> int:
     race_pin = _RACE_BY_NAME[args.opponent_race_pin] if args.opponent_race_pin else None
     bot_ai = _load_bot(args.bot_script)
 
+    host_ip = args.host_ip or detect_tailscale_ip() or prompt_for_tailscale_install()
+    if host_ip is None:
+        print(
+            "ERROR: no --host-ip given and no Tailscale IP available. Pass --host-ip explicitly "
+            "(e.g. a LAN address, if you and the joiner are on the same network), or install and "
+            "log into Tailscale first.",
+            file=sys.stderr,
+        )
+        return 1
+
     portconfig = Portconfig()
     try:
         token = secrets.token_urlsafe(16)
         code = encode_match_code(
-            host_ip=args.host_ip,
+            host_ip=host_ip,
             portconfig=portconfig,
             map_name=args.map,
             race_pin=race_pin,
@@ -116,7 +128,7 @@ def main_host(argv: list[str] | None = None) -> int:
                     my_race,
                     bot_ai,
                     portconfig,
-                    args.host_ip,
+                    host_ip,
                     args.realtime,
                     args.time_limit,
                     join_timeout=args.timeout,

@@ -45,9 +45,14 @@ This will:
 3. Sync the fixed map pool this project's scripts and tests run on (see
    "Map pool" below) into the install's `Maps` directory.
 
-If `setup` can't find or install a client (e.g. Mac/Windows with no
-Battle.net install), it exits with an actionable message rather than
-guessing.
+On Mac/Windows with no Battle.net install found, `setup` opens the
+Battle.net download page and polls for the install to finish (Ctrl-C to
+give up early) -- there's no supported silent/scriptable installer for
+Battle.net-managed SC2 (unlike the Linux headless package above), so this
+guides a human through an interactive install rather than automating it.
+Skipped when the `CI` env var is set, or if you Ctrl-C out, or it times out
+after 20 minutes -- any of those fall through to an actionable message
+rather than guessing.
 
 `python-sc2` resolves the install location itself in this order: the
 `SC2PATH` env var, then Battle.net's `ExecuteInfo.txt`, then the platform
@@ -298,7 +303,7 @@ code) and the other **joins** using that code.
 
 ```bash
 # Host side:
-sc2-sdk-host bots/idle_example.py --race terran --host-ip <address the joiner can reach you at>
+sc2-sdk-host bots/idle_example.py --race terran
 # Prints, e.g.: MATCH CODE: eyJob3N0X2lwIjoiMTAuMC4wLjUiLCA...
 
 # Join side (paste the code from the host):
@@ -307,10 +312,17 @@ sc2-sdk-join <code> bots/idle_example.py --race zerg
 
 - **Networking is not built or operated by this project.** `--host-ip` must
   already be reachable from the joiner's machine -- same network, or a VPN/
-  tunnel you set up yourselves (e.g. Tailscale, ngrok). There is no relay or
-  NAT-traversal service; see the design discussion on
+  tunnel you set up yourselves. There is no relay or NAT-traversal service;
+  see the design discussion on
   [issue #12](https://github.com/blokboy/sc2-sdk/issues/12) for why that's
   a deliberate scope line, not an oversight.
+- **`--host-ip` is optional -- Tailscale-aware by default.** Omit it and
+  `sc2-sdk-host` looks for a local Tailscale IP (`install.tailscale`); if
+  Tailscale isn't installed, it opens the download page and waits for you
+  to install and log in (polling, not a blocking prompt -- same guided
+  shape as the Battle.net install flow above), then picks up the IP
+  automatically. Pass `--host-ip` explicitly to skip this (e.g. same-LAN
+  play, or your own VPN/tunnel).
 - **Both machines need the same map already synced** -- run `sc2-sdk-setup`
   (see "Get a local SC2 client + map pool" above) on both sides first. The
   underlying protocol resolves the map as a local file path independently

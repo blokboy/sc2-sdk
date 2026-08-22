@@ -36,6 +36,17 @@ assuming success. See `outcomes.py` for the exact three-way ok/confirmed/
 error shape this produces, and `runtime.py` for how a `BotAI` subclass
 built around this class is actually driven through a live game.
 
+`_advance_steps` drives its progress by sending a manual `RequestStep` to
+the SC2 engine -- only a meaningful request when the engine is otherwise
+paused, which non-realtime mode guarantees (nothing but `sc2.main`'s outer
+loop ever steps it) but realtime mode does not: there, the engine already
+free-runs on its own wall-clock timer and `sc2.main`'s own realtime branch
+never calls `client.step()` itself. `Bot._advance` therefore branches on
+`self._ai.realtime` and uses `Bot._advance_realtime` instead in that case --
+same flush-then-reobserve shape, but it waits for the engine's own
+free-running simulation to reach a target game loop rather than manually
+stepping it. See `Bot._advance`'s docstring for the full reasoning.
+
 Race-agnostic by design: train/build/research/move/chat are all generic
 python-sc2 mechanisms (the same underlying `BotAI.train()`/`.build()`/
 `.research()` work for any of the three races); nothing Terran-specific is
@@ -46,8 +57,10 @@ directly rather than re-deriving the verification pattern.
 
 from __future__ import annotations
 
+from s2clientprotocol import sc2api_pb2 as sc_pb
 from sc2.bot_ai import BotAI
 from sc2.data import Result
+from sc2.game_state import GameState
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.ids.upgrade_id import UpgradeId
 from sc2.position import Point2
@@ -117,10 +130,49 @@ class Bot:
     async def _advance(self, frames: int = _POLL_FRAMES) -> None:
         """Flush queued actions, advance the simulation by `frames` raw
         simulation frames, and refresh self._ai's state -- see the module
-        docstring for why this is necessary for verification. Thin wrapper
-        around python-sc2's own `BotAI._advance_steps`, which is `@final`
-        and explicitly documented for this purpose."""
-        await self._ai._advance_steps(frames)  # noqa: SLF001 -- see module docstring
+        docstring for why this is necessary for verification.
+
+        Branches on `self._ai.realtime` (set by python-sc2's own
+        `_prepare_start`): non-realtime games use `BotAI._advance_steps`
+        directly, a thin wrapper around python-sc2's own `@final`,
+        explicitly-documented-for-this-purpose method. Realtime games use
+        `_advance_realtime` instead: `_advance_steps` sends a manual
+        `RequestStep` to the SC2 engine, which is only a
+        meaningful request when the engine is otherwise paused (true in
+        non-realtime mode, where `sc2.main`'s own outer loop is the only
+        thing that ever steps it). In realtime mode the engine already
+        free-runs on its own wall-clock timer -- `sc2.main._play_game_ai`'s
+        realtime branch never calls `client.step()` at all -- so issuing
+        `RequestStep` concurrently with that free-run is exactly the
+        untested "debugging and testing tool only" territory
+        `_advance_steps`'s own upstream docstring warns about, and
+        empirically stalled for tens of real seconds per call."""
+        if self._ai.realtime:
+            await self._advance_realtime(frames)
+        else:
+            await self._ai._advance_steps(frames)  # noqa: SLF001 -- see module docstring
+
+    async def _advance_realtime(self, frames: int) -> None:
+        """Realtime-mode equivalent of `BotAI._advance_steps` that waits
+        for `frames` more game loops to elapse on the server's own
+        free-running wall-clock simulation, instead of manually stepping
+        it. Mirrors the request shape `sc2.main._play_game_ai`'s own
+        realtime branch uses: a `client.observation(game_loop=...)` call
+        pinned to a specific future loop blocks until the server's
+        already-ticking simulation actually reaches it, which is the
+        realtime-legal way to "wait a bit and re-observe" -- unlike
+        `_advance_steps`, this never sends a `RequestStep`. The rest
+        mirrors `_advance_steps` exactly (same private hooks, same
+        reasoning for reaching into them -- see this class's `_advance`
+        and the module docstring)."""
+        ai = self._ai
+        await ai._after_step()  # noqa: SLF001 -- see module docstring
+        target_loop = ai.state.game_loop + frames
+        state = await ai.client.observation(target_loop)
+        gs = GameState(state.observation)
+        proto_game_info = await ai.client._execute(game_info=sc_pb.RequestGameInfo())  # noqa: SLF001
+        ai._prepare_step(gs, proto_game_info)  # noqa: SLF001
+        await ai.issue_events()
 
     def _resolve_units(self, units: Unit | Units | int | list) -> tuple[list[Unit], list[int]]:
         """Normalize a caller-supplied unit selector (a Unit, a tag, or an
@@ -284,6 +336,19 @@ class Bot:
         has even arrived at the site -- see the module docstring on why a
         real subsequent observation, not optimistic bookkeeping, is what
         "confirmed" means here).
+
+        Checks `tech_requirement_progress` first, same as `train()`: unlike
+        `train()`'s underlying `BotAI.train`, `BotAI.build` doesn't validate
+        this itself -- it happily finds a placement, assigns a worker, and
+        issues the command even when the prerequisite (e.g. a Barracks
+        before any Supply Depot has *finished*, not just started) isn't
+        met. The SC2 server then silently drops the command server-side:
+        no error, no order ever appears on the worker, nothing to
+        re-observe -- so without this check here, `dispatched` above would
+        be `True` while nothing happened, and confirmation would fail for
+        an entirely different reason (never having been dispatched at all)
+        than what `effect_confirmed=False` normally means (dispatched, but
+        not yet observably true).
         """
         ai = self._ai
         self._require_live()
@@ -291,6 +356,19 @@ class Bot:
         near_point = near.position if isinstance(near, Unit) else near
         position_report = (near_point.x, near_point.y) if isinstance(near_point, Point2) else None
 
+        if ai.tech_requirement_progress(structure_type) < 1:
+            return BuildOutcome(
+                ok=False,
+                effect_confirmed=False,
+                error=(
+                    f"Tech requirement not met for {structure_type.name}: the building(s) "
+                    "required to build it aren't ready yet."
+                ),
+                detail="Command not dispatched: tech requirement check failed.",
+                structure_type=structure_type.name,
+                position=position_report,
+                structure_tag=None,
+            )
         if not ai.can_afford(structure_type):
             cost = ai.calculate_cost(structure_type)
             return BuildOutcome(

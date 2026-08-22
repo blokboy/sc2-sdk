@@ -92,6 +92,17 @@ assuming success. See `outcomes.py` for the exact three-way ok/confirmed/
 error shape this produces, and `runtime.py` for how a `BotAI` subclass
 built around this class is actually driven through a live game.
 
+`_advance_steps` drives its progress by sending a manual `RequestStep` to
+the SC2 engine -- only a meaningful request when the engine is otherwise
+paused, which non-realtime mode guarantees (nothing but `sc2.main`'s outer
+loop ever steps it) but realtime mode does not: there, the engine already
+free-runs on its own wall-clock timer and `sc2.main`'s own realtime branch
+never calls `client.step()` itself. `Bot._advance` therefore branches on
+`self._ai.realtime` and uses `Bot._advance_realtime` instead in that case --
+same flush-then-reobserve shape, but it waits for the engine's own
+free-running simulation to reach a target game loop rather than manually
+stepping it. See `Bot._advance`'s docstring for the full reasoning.
+
 Race-agnostic by design: train/build/research/move/chat are all generic
 python-sc2 mechanisms (the same underlying `BotAI.train()`/`.build()`/
 `.research()` work for any of the three races); nothing Terran-specific is
@@ -171,6 +182,19 @@ happens as soon as the assigned worker is *dispatched*, before it
 has even arrived at the site -- see the module docstring on why a
 real subsequent observation, not optimistic bookkeeping, is what
 "confirmed" means here).
+
+Checks `tech_requirement_progress` first, same as `train()`: unlike
+`train()`'s underlying `BotAI.train`, `BotAI.build` doesn't validate
+this itself -- it happily finds a placement, assigns a worker, and
+issues the command even when the prerequisite (e.g. a Barracks
+before any Supply Depot has *finished*, not just started) isn't
+met. The SC2 server then silently drops the command server-side:
+no error, no order ever appears on the worker, nothing to
+re-observe -- so without this check here, `dispatched` above would
+be `True` while nothing happened, and confirmation would fail for
+an entirely different reason (never having been dispatched at all)
+than what `effect_confirmed=False` normally means (dispatched, but
+not yet observably true).
 
 #### `Bot.research`
 
@@ -778,8 +802,11 @@ def main(argv: list[str] | None=None) -> int
 MCP `execute_code` interactive mode -- ticket #6
 (https://github.com/blokboy/sc2-sdk/issues/6): an MCP server exposing a
 single `execute_code` tool that evaluates a Python snippet against live
-`bot`/`sdk` globals bound to a running game, with the game paused between
-calls rather than advancing on wall-clock time.
+`bot`/`sdk` globals bound to a running game. By default the game is paused
+between calls rather than advancing on wall-clock time; pass
+`realtime=True` (`--realtime` on the CLI) to run it at wall-clock speed
+instead, e.g. for a human spectating the rendered client live -- see
+`_build_session`'s docstring for what that does and doesn't change.
 
 Concurrency/communication design
 ---------------------------------
@@ -950,14 +977,16 @@ one.
 ### `serve_execute_code`
 
 ```python
-async def serve_execute_code(map_name: str=DEFAULT_MAP, my_race: Race=Race.Terran, opponent_race: Race=Race.Random, difficulty: Difficulty=Difficulty.Easy, game_time_limit: int | None=None) -> ExecuteCodeSession
+async def serve_execute_code(map_name: str=DEFAULT_MAP, my_race: Race=Race.Terran, opponent_race: Race=Race.Random, difficulty: Difficulty=Difficulty.Easy, game_time_limit: int | None=None, realtime: bool=False) -> ExecuteCodeSession
 ```
 
-Launch a real game against the built-in AI (non-realtime, i.e.
-stepped mode -- always; there is no realtime option here, since
-stepped-between-calls is the entire point of this ticket) and return an
-`ExecuteCodeSession` wrapping a `FastMCP` server whose `execute_code`
-tool is live against it.
+Launch a real game against the built-in AI -- stepped (paused
+between calls) by default, or wall-clock speed if `realtime=True`, see
+`_build_session` -- and return an `ExecuteCodeSession` wrapping a
+`FastMCP` server whose `execute_code` tool is live against it, once the
+game has actually loaded and is ready for calls -- callers that need a
+session back only once it's fully live (e.g. the wiring test below)
+should use this; `main()` does not, see `_build_session`.
 
 Does not itself serve any transport -- callers decide that. The
 console-script entrypoint (`main()` below) serves it over stdio, the
@@ -1324,13 +1353,26 @@ command, no Battle.net/GUI required.
 Order of operations (mirrors the ticket's acceptance criteria):
   1. Detect an existing Battle.net install (Windows/Mac) -- use it if found.
   2. Otherwise, on Linux, install Blizzard's headless package.
-  3. Otherwise (Mac/Windows with no Battle.net install), fail with an
-     actionable message -- the headless package cannot run there.
+  3. Otherwise (Mac/Windows with no Battle.net install), guide the user
+     through installing it via Battle.net, then poll for it -- see
+     `_prompt_for_battlenet_install`. Blizzard provides no supported
+     silent/scriptable installer for Battle.net-managed SC2 (unlike the
+     Linux headless package, which is an explicit, documented
+     CI/automation artifact), so this waits for a human to finish an
+     interactive install elsewhere rather than trying to automate it.
+     Skipped entirely (falls straight to the actionable-error message
+     below) when the `CI` env var is set.
   4. Sync the fixed map pool onto whichever install was selected.
 
 Usage:
     python -m install.cli
     sc2-sdk-setup  (after `pip install -e .`)
+
+### `BATTLENET_DOWNLOAD_URL`
+
+```python
+BATTLENET_DOWNLOAD_URL = 'https://starcraft2.com'
+```
 
 ### `main`
 

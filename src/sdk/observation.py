@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from sc2.bot_ai import BotAI
 from sc2.data import Result
+from sc2.game_data import AbilityData, GameData
 from sc2.unit import Unit
 
 
@@ -45,7 +46,59 @@ class UnitSnapshot:
     order_abilities: tuple[str, ...]
 
 
-def _snapshot(unit: Unit) -> UnitSnapshot:
+def _order_ability_name(ability_id: int, abilities: dict[int, AbilityData]) -> str:
+    """Resolve one order's raw `ability_id` to python-sc2's `AbilityId` name,
+    tolerating an id that isn't in `abilities`.
+
+    `abilities` is `BotAI.game_data.abilities`, a dict python-sc2 caches from
+    the game client's static data at match start -- but it's only populated
+    for ids that map onto a *known* member of python-sc2's `AbilityId` enum
+    (see `GameData.__init__` in `sc2/game_data.py`: it builds the dict from
+    `{a.value for a in AbilityId if a.value != 0}`), so an ability id the
+    game itself reports that isn't in that enum simply has no entry. See
+    issue #13: id 4135 was observed live, on an SCV's order mid-harvest-
+    transition (exact ability unconfirmed) -- upstream's
+    `UnitOrder.from_proto` (`sc2/unit.py`) does a bare
+    `game_data.abilities[proto.ability_id]` subscript with no fallback for
+    this case, so *we* do the lookup here instead and fall back to a
+    placeholder built from the raw id rather than letting `KeyError`
+    propagate.
+    """
+    try:
+        return abilities[ability_id].exact_id.name
+    except KeyError:
+        return f"UNKNOWN_ABILITY_{ability_id}"
+
+
+def _order_abilities(unit: Unit, game_data: GameData) -> tuple[str, ...]:
+    """Ability names for every order currently queued on `unit`.
+
+    Tries `unit.orders` first -- python-sc2's own parsed `UnitOrder` list --
+    since that's the common, fast path taken for every order this project
+    has ever seen a valid ability id for. But `unit.orders` builds its whole
+    list eagerly (`UnitOrder.from_proto` for *every* raw order, up front,
+    each doing the same unguarded `game_data.abilities[...]` subscript
+    `_order_ability_name` above works around), so one order with an
+    unrecognized ability id anywhere in the list raises `KeyError` before
+    any order -- including this unit's other, perfectly fine orders --
+    comes back at all. See issue #13: that `KeyError` used to propagate all
+    the way out of `observe()` (called for *every* unit in the game), taking
+    down `bot.observe()` and `bot.build()`'s post-dispatch confirmation step
+    for the rest of the session over one bad order on one unit.
+
+    When `unit.orders` raises, fall back to walking the unit's raw proto
+    orders directly (`unit._proto.orders`, the same source `UnitOrder.
+    from_proto` reads) and resolving each order's ability name individually
+    via `_order_ability_name`, so a single bad order can't take out anything
+    beyond that one order's own entry in the result.
+    """
+    try:
+        return tuple(order.ability.exact_id.name for order in unit.orders)
+    except KeyError:
+        return tuple(_order_ability_name(order.ability_id, game_data.abilities) for order in unit._proto.orders)
+
+
+def _snapshot(unit: Unit, game_data: GameData) -> UnitSnapshot:
     return UnitSnapshot(
         tag=unit.tag,
         type_name=unit.type_id.name,
@@ -56,7 +109,7 @@ def _snapshot(unit: Unit) -> UnitSnapshot:
         energy=unit.energy,
         build_progress=unit.build_progress,
         is_idle=unit.is_idle,
-        order_abilities=tuple(order.ability.exact_id.name for order in unit.orders),
+        order_abilities=_order_abilities(unit, game_data),
     )
 
 
@@ -131,10 +184,10 @@ def observe(ai: BotAI, match_result: Result | None) -> Observation:
     """
     return Observation(
         game_time=ai.time,
-        units=tuple(_snapshot(u) for u in ai.units),
-        structures=tuple(_snapshot(u) for u in ai.structures),
-        enemy_units=tuple(_snapshot(u) for u in ai.enemy_units),
-        enemy_structures=tuple(_snapshot(u) for u in ai.enemy_structures),
+        units=tuple(_snapshot(u, ai.game_data) for u in ai.units),
+        structures=tuple(_snapshot(u, ai.game_data) for u in ai.structures),
+        enemy_units=tuple(_snapshot(u, ai.game_data) for u in ai.enemy_units),
+        enemy_structures=tuple(_snapshot(u, ai.game_data) for u in ai.enemy_structures),
         minerals=ai.minerals,
         vespene=ai.vespene,
         supply_used=ai.supply_used,
