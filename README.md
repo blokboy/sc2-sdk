@@ -146,7 +146,9 @@ of silently no-op'ing.
 ## Play interactively via MCP (ticket #6)
 
 `sc2-sdk-mcp` (or `python -m sdk.mcp_server`) launches a real game against
-the built-in AI and serves a single MCP tool, `execute_code`, over stdio:
+the built-in AI and serves five MCP tools -- `execute_code`, `new_game`,
+and the standing-background-task trio `start_task`/`task_status`/
+`cancel_task` (see below) -- over stdio:
 
 ```bash
 sc2-sdk-mcp
@@ -184,6 +186,185 @@ play. Run `sc2-sdk-mcp --help` for the full list. See
 `tests/integration/test_execute_code_mcp.py` for a full worked example,
 including the wiring test that confirms the game is genuinely paused/stepped
 (not free-running) between calls.
+
+**Snippets are timed out, with one automatic retry, so a bug can't wedge
+the session.** Before this, a snippet that never returned (e.g. an
+infinite loop with a genuine `await` inside it, such as a supply-cap bug
+that turned `while scvs_needed > 0: ... await bot._advance(22)` into an
+infinite loop) would block `on_step` -- and therefore the whole game --
+forever, recoverable only via `new_game` (or killing the process). Now
+each `execute_code` call is bounded by a timeout: if a snippet doesn't
+finish in time, it's cancelled, moved to the *end* of the internal call
+queue, and retried exactly once (so any other calls already queued behind
+it get their turn first) -- the original caller's `execute_code` call
+just stays pending through this and, if the retry succeeds, gets the
+successful result with no error surfaced at all. Only if the retry *also*
+times out does the call fail, with a clear `ok=False` result whose
+`error` names the timeout used and includes the snippet's own code, so
+you know exactly what failed.
+
+The timeout defaults to a generous 45 seconds (tens of seconds, not
+single-digit -- see `DEFAULT_SNIPPET_TIMEOUT_SECONDS` in
+`src/sdk/mcp_server.py` for the full reasoning), set per-server via
+`--snippet-timeout <seconds>` and persisting across `new_game` calls the
+same way `--realtime`/`--map`/etc. do. For a snippet you know will
+legitimately run long -- e.g. `while not sdk.can_afford(X): await
+bot._advance(22)` waiting on slow mineral income, which can genuinely
+take upwards of a minute in `--realtime` mode -- pass a per-call
+`timeout_seconds` argument to that one `execute_code` call instead of
+raising the server-wide default for every other call too:
+
+```python
+# an execute_code call's arguments, raising the timeout for just this one call
+{"code": "while not sdk.can_afford(...):\n    await bot._advance(22)", "timeout_seconds": 120}
+```
+
+**Start another game without reconnecting: `new_game`.** Previously the
+only way to play a second match was to fully disconnect and reconnect the
+MCP server (e.g. Claude Code's `/mcp` command), which relaunches the whole
+`sc2-sdk-mcp` subprocess from scratch. Calling the `new_game` tool instead
+ends whatever game is currently active (if any) and starts a fresh one on
+the *same* stdio connection -- subsequent `execute_code` calls transparently
+talk to the new game:
+
+```python
+# a new_game call's arguments (all optional):
+{}  # no arguments: same map/races/difficulty/realtime sc2-sdk-mcp was launched with
+```
+
+```python
+# or override any subset, same names/values as the CLI flags above:
+{"map_name": "KairosJunctionLE", "opponent_race": "protoss", "difficulty": "hard"}
+```
+
+`new_game` waits for the new game to be ready before returning, and its
+response is a small JSON confirmation: `{"map_name": ..., "my_race": ...,
+"opponent_race": ..., "difficulty": ..., "game_time_limit": ...,
+"realtime": ..., "snippet_timeout_seconds": ..., "previous_game_torn_down":
+...}`. Like the other fields, `new_game` also accepts an optional
+`snippet_timeout_seconds` argument to override the per-call snippet
+timeout for the game it's about to start; omit it to keep whatever this
+server was originally launched with (`--snippet-timeout`, see below).
+
+If a game is still running when `new_game` is called, that game's task is
+cancelled outright (not waited on to finish naturally) so the underlying
+SC2 client process is torn down and a fresh one can start -- this is also
+what recovers a session that's gotten permanently stuck inside an
+`execute_code` snippet that never returns (e.g. a buggy infinite loop):
+cancelling unwinds the stuck `await` via normal `asyncio.CancelledError`
+propagation, which was previously unrecoverable short of killing the whole
+`sc2-sdk-mcp` process. See `build_server`'s `new_game` docstring in
+`src/sdk/mcp_server.py` for the full design writeup, including what happens
+to an `execute_code` call still in flight against the old game when
+`new_game` runs concurrently.
+
+**Standing background tasks: `start_task`/`task_status`/`cancel_task`.**
+An open-ended, goal-directed instruction -- "have an SCV build Supply
+Depots until we have 30" -- can legitimately take many real minutes
+(waiting on mineral income, one depot at a time), which doesn't fit
+`execute_code`'s per-call shape well: either the snippet loops internally
+until the goal is met, which looks exactly like a runaway snippet and
+either gets caught by the per-call timeout above or needs a huge
+`timeout_seconds` override just for this one call (imprecise, and it
+raises the bar for detecting an *actual* bug in every other call too), or
+the calling agent re-issues `execute_code` itself in a polling loop, which
+blocks that agent's own turn for just as long either way. `start_task`
+instead registers a **standing background task**: one snippet ("step
+code"), evaluated repeatedly, one bounded turn per call, interleaved
+fairly (FIFO) with ordinary `execute_code` calls through the exact same
+internal call queue `on_step` already drains one item at a time -- so the
+game's "only one thing touches `bot`/`sdk` at once" invariant holds
+exactly as it does today; a background task is a different *kind* of
+queued item, never a second, concurrently-running execution path. See
+`src/sdk/mcp_server.py`'s module docstring, "Standing background tasks"
+section, for the full design.
+
+Each turn does ONE bounded chunk of work, then reports whether the goal is
+met via its trailing return value -- reusing `execute_code`'s existing
+"trailing expression becomes the result" convention verbatim (an explicit
+`return` works too, anywhere in the snippet, since the step code's body
+literally becomes a real `async def` function body): `True`/truthy ends
+the task successfully, `False`/falsy means "keep going, schedule another
+turn". Concretely, the supply-depot scenario above as one task:
+
+```python
+# a start_task call's `code` argument -- one turn of "SCVs build Supply
+# Depots until we have 30":
+from sc2.ids.unit_typeid import UnitTypeId
+
+depot_count = len(sdk.structures(UnitTypeId.SUPPLYDEPOT))
+if depot_count >= 30:
+    return True
+if sdk.can_afford(UnitTypeId.SUPPLYDEPOT):
+    depot_point = sdk.townhalls.first.position.towards(sdk.game_info.map_center, 6)
+    depot_point = depot_point.offset((depot_count * 3, 0))
+    await bot.build(UnitTypeId.SUPPLYDEPOT, near=depot_point)
+else:
+    await bot._advance(22)
+return False
+```
+
+```python
+# the start_task call itself:
+{"code": "<the snippet above>", "description": "SCVs build Supply Depots until we have 30"}
+```
+
+`start_task` returns `{"task_id": "task-1"}` **immediately** -- it does not
+wait for the first turn, let alone the whole goal, to run. Each turn is
+independently subject to the same per-call timeout and single automatic
+retry described above (a turn that hangs is caught exactly like a hung
+ordinary snippet would be); on a plain exception, or once both timeout
+attempts are exhausted, the *task* is marked failed and no further turns
+are scheduled -- a broken task never spins forever. An optional
+`max_iterations` argument (default 1000) bounds how many turns a task will
+run before giving up as failed if the goal is never reached; raise it for
+a goal you know genuinely needs more turns.
+
+Progress is pull-based, not pushed (MCP tools are request/response, so
+there's no channel for a task to notify you unprompted) -- poll
+`task_status`:
+
+```python
+# check in on one task:
+{"task_id": "task-1"}
+# -> {"ok": true, "task_id": "task-1", "description": "...", "status":
+#     "running"|"done"|"failed"|"cancelled", "iterations": 7,
+#     "max_iterations": 1000, "log": ["[turn 1] result=False", ...],
+#     "result": null, "error": null}
+
+# or list every task currently known to the game:
+{}
+# -> {"tasks": [ ... one dict per task, same shape as above ... ]}
+```
+
+`log` is capped at the most recent 50 turns (oldest evicted first) so a
+long-running task's status response stays small and fast to read, while
+still showing a meaningful window of recent activity.
+
+`cancel_task({"task_id": "task-1"})` stops a running task from scheduling
+any *further* turns; a turn already in flight or already queued is
+allowed to finish naturally first (interrupting a turn mid-flight is
+deliberately out of scope -- python-sc2's internals aren't safe to
+interrupt mid-call any more than they're safe to call concurrently), after
+which the task's status becomes `"cancelled"`.
+
+**A task does not survive `new_game`.** Tasks belong to whichever game was
+active when `start_task` registered them; once `new_game` replaces that
+game with a fresh one, the old task's `task_id` becomes unresolvable
+(`task_status` reports it as unknown, the same as a `task_id` that was
+never registered at all) -- no explicit cleanup call is needed first. See
+`start_task`'s docstring in `src/sdk/mcp_server.py` for why this requires
+no special-casing beyond what `new_game` already does for an ordinary
+in-flight `execute_code` call.
+
+**Only one `sc2-sdk-mcp` (and its SC2 client) runs at a time.** Every
+startup checks for a stale prior `sc2-sdk-mcp` instance left running from
+an earlier `/mcp` reconnect and, if found, terminates it along with the
+SC2 client process it explicitly spawned, before doing anything else. This
+is purely defensive housekeeping, not something you interact with -- see
+`src/sdk/mcp_server.py`'s "Single-instance guard + explicit SC2-client PID
+tracking" section for the full mechanism and the operational incident it
+fixes.
 
 ## Play an autonomous bot script (ticket #7)
 

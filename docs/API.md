@@ -800,12 +800,19 @@ def main(argv: list[str] | None=None) -> int
 *Source: [`src/sdk/mcp_server.py`](../src/sdk/mcp_server.py)*
 
 MCP `execute_code` interactive mode -- ticket #6
-(https://github.com/blokboy/sc2-sdk/issues/6): an MCP server exposing a
-single `execute_code` tool that evaluates a Python snippet against live
-`bot`/`sdk` globals bound to a running game. By default the game is paused
-between calls rather than advancing on wall-clock time; pass
-`realtime=True` (`--realtime` on the CLI) to run it at wall-clock speed
-instead, e.g. for a human spectating the rendered client live -- see
+(https://github.com/blokboy/sc2-sdk/issues/6): an MCP server exposing an
+`execute_code` tool that evaluates a Python snippet against live `bot`/
+`sdk` globals bound to a running game, and a `new_game` tool that starts a
+fresh game on the same stdio connection instead of requiring a full MCP
+reconnect for every match (see `build_server`'s `new_game` docstring for
+the design: a small mutable `_ActiveGame` holder both tools route through,
+and why `new_game` cancels the previous `game_task` outright rather than
+waiting for it to finish -- that same cancellation is also what recovers a
+session wedged forever inside a runaway snippet that never returns). By
+default the game is paused between calls rather than advancing on
+wall-clock time; pass `realtime=True` (`--realtime` on the CLI, or
+`new_game`'s `realtime` argument) to run it at wall-clock speed instead,
+e.g. for a human spectating the rendered client live -- see
 `_build_session`'s docstring for what that does and doesn't change.
 
 Concurrency/communication design
@@ -879,6 +886,217 @@ structured `ok=False`/`error` result (mirroring this project's existing
 outcomes.py convention) rather than propagating out of `on_step` and
 crashing the running game.
 
+Per-call timeout and single automatic retry
+---------------------------------------------
+The above except-`Exception` clause does NOT protect against a snippet
+that simply never finishes -- and that's not hypothetical: a snippet with
+a genuine bug (`while scvs_needed > 0: ... else: await bot._advance(22)`,
+where the `else` was unreachable because of a missing supply-cap check)
+looped forever, each iteration doing a real `await`, and wedged `on_step`
+-- and therefore the whole game -- permanently, with no recovery short of
+killing the whole `sc2-sdk-mcp` process. `new_game` (above) can recover
+*after the fact* by cancelling the wedged game outright, but nothing
+prevented getting wedged in the first place, and a merely-slow (not
+actually buggy) call had no chance to just be retried.
+
+`ExecuteCodeBotAI.on_step` now wraps the `_eval_snippet` call in
+`asyncio.wait_for(..., timeout=request.timeout_seconds)` -- the same
+cancellation mechanism `new_game` already relies on (see its docstring in
+`build_server`): `wait_for` cancels its inner task on timeout, which
+propagates an ordinary `asyncio.CancelledError` into whatever the
+snippet's `await` chain is currently suspended on. `_eval_snippet`'s own
+`except Exception` (not `BaseException`) does NOT swallow that
+`CancelledError` -- `CancelledError` is a `BaseException` subclass, not an
+`Exception` subclass, on the Python version this project targets -- so
+the cancellation unwinds cleanly out of `wait_for` as a `TimeoutError`,
+exactly as intended, rather than being silently caught and reported as an
+ordinary snippet exception.
+
+The retry policy, in `on_step`:
+
+  1. **First timeout**: the caller's future is deliberately left unresolved
+     (`execute_code`'s MCP call stays pending). The same `_PendingRequest`
+     is mutated (`attempt` incremented from 1 to 2) and re-enqueued onto
+     the *end* of `self._queue` via `await self._queue.put(request)` -- so
+     any other calls already queued behind it get their turn first, and
+     this one gets exactly one more shot after them.
+  2. **Second timeout** (the retry also times out): the future IS resolved
+     now, with `ExecuteCodeResult(ok=False, ...)` whose `error` spells out
+     that the snippet timed out on both the original attempt and the
+     automatic retry, the timeout duration used, and the snippet's own
+     code -- so whoever reads the result (the MCP tool's return value,
+     surfaced straight back to the calling agent) knows unambiguously what
+     failed and why, without needing to go dig through server logs.
+  3. A snippet that finishes within its timeout on either attempt resolves
+     normally -- the caller never sees a timeout error at all in that case,
+     only (if it happened) a brief delay while any calls queued behind the
+     slow first attempt got processed first.
+
+Timeout value: configurable, not one hardcoded constant, because this
+project's `--realtime` mode has *legitimately* slow snippets that are not
+bugs -- e.g. `while not sdk.can_afford(X): await bot._advance(22)` waiting
+for minerals to accumulate can genuinely take a while in real time if
+income is slow. See `DEFAULT_SNIPPET_TIMEOUT_SECONDS` for the default and
+its reasoning, and `execute_code`'s `timeout_seconds` argument for the
+per-call override a caller who knows a specific snippet will legitimately
+run long can use instead of raising the server-wide default (which would
+make every *other* call wait just as long before a real bug is ever
+detected). The effective timeout for a given call -- server default or
+per-call override -- is resolved once, in `submit()`, and carried on the
+`_PendingRequest` itself, so a requeued retry reuses the exact same
+timeout its first attempt used rather than silently re-resolving against
+a `new_game`-updated server default mid-flight.
+
+Interaction with `new_game`: a timed-out-and-requeued request lives in a
+specific `ExecuteCodeBotAI` instance's `self._queue`, tied to that
+instance's `on_step` loop. If `new_game` cancels that game entirely while
+a retry is still queued (or in flight), the existing `submit()`/
+`game_task`-racing logic (see `submit()`'s docstring) already produces a
+clean "match ended" result for it -- exactly the same path any other
+in-flight call takes during a `new_game`-triggered cancellation, since
+`game_task.cancel()` only ever propagates a plain `CancelledError`
+(distinct from the `TimeoutError` `wait_for` raises on an ordinary
+timeout) out through `on_step`, past the retry logic entirely, and into
+`_host_game`'s own cleanup. Nothing extra was needed for this case.
+
+Standing background tasks: `start_task`/`task_status`/`cancel_task`
+----------------------------------------------------------------------
+The problem this solves: an open-ended, goal-directed instruction like
+"have an SCV build Supply Depots until we have 30" can legitimately take
+many real minutes (waiting on mineral income, one depot at a time) --
+which is exactly the kind of "legitimately slow, not a bug" case the
+per-call timeout above is deliberately generous about, but a *single*
+`execute_code` call still isn't the right shape for it: either the
+snippet loops internally until the goal is met (in which case it looks
+identical to a runaway snippet from `on_step`'s perspective, and either
+gets killed by the timeout or -- worse -- requires the caller to pass a
+huge `timeout_seconds` override for this one goal, which the project
+explicitly rejected: "arbitrary flagging of tasks with different cooldown
+is very imprecise"), or the calling agent has to re-issue `execute_code`
+itself in a polling loop, which blocks that agent's own turn for just as
+long. Neither lets other `execute_code` calls (e.g. a human checking in
+on a completely different part of the game) get serviced while the goal
+is pending.
+
+The fix implemented here is NOT a second, concurrently-scheduled
+execution path -- see this module's "Concurrency/communication design"
+section above for why that would be unsafe (two coroutines calling into
+`self.bot`/`self.sdk` at genuinely overlapping times, racing on
+python-sc2's unsynchronized internal state). Instead, a background task is
+just a different *kind* of item on the exact same `self._queue` `on_step`
+already drains one at a time:
+
+  - `start_task(code, description, max_iterations)` registers a
+    `_TaskState` (in `self._tasks`, keyed by a short incrementing
+    `task_id`) and immediately enqueues ONE turn for it -- a
+    `_PendingRequest` whose `task_id` is set (see `_PendingRequest`'s
+    docstring) instead of carrying a caller-facing `future` -- via
+    `self._queue.put_nowait(...)`. `put_nowait` never blocks (this
+    module's queues are unbounded, same as `submit()`'s `await
+    self._queue.put(...)`, which also never actually suspends), so
+    `start_task` returns to its caller the instant the first turn is
+    queued, without waiting for that turn -- let alone the whole goal --
+    to run. This is what makes it "not just `execute_code` with a bigger
+    timeout": the goal can take as many real-world turns as it needs,
+    each one bounded by the ordinary per-call timeout, while the
+    `start_task` call itself returns in microseconds.
+  - Each turn is `code` -- ONE snippet, evaluated repeatedly, doing ONE
+    bounded chunk of work per turn (check progress, do a small amount of
+    work if the goal isn't met yet, or wait a tick if not yet
+    affordable), then signal "keep going" or "goal met" via its return
+    value -- reusing `_eval_snippet`'s *existing* "trailing expression (or
+    an explicit `return`, since the snippet's body literally becomes a
+    real `async def` function body -- nothing new needed for that to
+    work) becomes the result" convention verbatim. No new
+    snippet-evaluation semantics: the only new thing is a *convention* for
+    what a task's return value means -- `True` (or any truthy value) ends
+    the task successfully; `False`/falsy keeps it going. Concretely, the
+    user's own supply-depot scenario as one task's `code`:
+
+        from sc2.ids.unit_typeid import UnitTypeId
+
+        depot_count = len(sdk.structures(UnitTypeId.SUPPLYDEPOT))
+        if depot_count >= 30:
+            return True
+        if sdk.can_afford(UnitTypeId.SUPPLYDEPOT):
+            depot_point = sdk.townhalls.first.position.towards(sdk.game_info.map_center, 6)
+            depot_point = depot_point.offset((depot_count * 3, 0))
+            await bot.build(UnitTypeId.SUPPLYDEPOT, near=depot_point)
+        else:
+            await bot._advance(22)
+        return False
+
+    registered via `start_task(code=..., description="SCVs build Supply
+    Depots until we have 30")`. Each turn either builds one more depot (if
+    affordable) or waits one tick for minerals, then reports `False` to
+    request another turn -- until `depot_count >= 30`, when a turn
+    finally returns `True` and the task is marked done. Every turn is
+    independently subject to the same `asyncio.wait_for` timeout + single
+    retry ordinary `execute_code` calls get (see the section above) --
+    reused, not reimplemented (see `on_step` below) -- so a turn that
+    itself hangs (e.g. a bug in the task's own code) is caught exactly
+    like a hung ordinary snippet would be, it just marks the *task* failed
+    afterward instead of resolving a caller's future.
+  - `on_step` doesn't care whether the `_PendingRequest` it just dequeued
+    came from `submit()` (ordinary `execute_code`) or `start_task`
+    (a task turn) -- it runs `_eval_snippet` under the identical
+    `asyncio.wait_for(..., timeout=request.timeout_seconds)` either way.
+    Only what happens *after* that differs, and it's a single `if
+    request.task_id is not None: ... else: ...` branch at each of the two
+    existing resolution points (the timeout-exhausted branch and the
+    normal-completion branch) -- see `_finish_task_turn`. This is what
+    "reuses the existing timeout/retry machinery rather than forking a
+    parallel implementation" means concretely: there is exactly one
+    `asyncio.wait_for(_eval_snippet(...))` call site in this whole module,
+    used by both kinds of request.
+  - `_finish_task_turn` (called from `on_step` once a turn's outcome --
+    success, ordinary failure, or both-attempts-timed-out -- is known)
+    updates the task's bookkeeping and decides what happens next: a
+    truthy result marks the task `"done"`; an `ok=False` result (an
+    exception, or a timeout that exhausted its retry) marks it `"failed"`
+    and stops -- a broken task does not spin forever; a falsy-but-`ok`
+    result means "keep going", which either re-enqueues one more turn (if
+    a `cancel_task` call hasn't set the task's `cancel_requested` flag,
+    and `max_iterations` hasn't been reached) or ends the task as
+    `"cancelled"`/`"failed"` (max-iterations-exhausted) instead. Because
+    at most one turn per task is EVER sitting in `self._queue` or actively
+    running at a time (a task's next turn is only enqueued from inside
+    `_finish_task_turn`, i.e. strictly after the previous turn's result is
+    already known), `cancel_task` never needs to interrupt an in-flight
+    turn -- it just flips `cancel_requested`, and the in-flight (or
+    already-queued) turn's own eventual `_finish_task_turn` call is
+    guaranteed to be the next -- and only -- place that flag is ever
+    consulted for that task.
+  - Progress is pull-based: `task_status(task_id)` reports the task's
+    current `status`/`iterations`/a capped recent-activity `log` (see
+    `_TASK_LOG_MAX_ENTRIES`) /`result`/`error` on demand. Nothing pushes
+    updates to a caller -- MCP tools are request/response, so there is no
+    server-initiated notification channel to build here; a caller
+    interested in a long-running task's progress polls `task_status`
+    instead, the same way a human might glance at a build order in
+    progress.
+  - Lifecycle: tasks live in `self._tasks` on a specific `ExecuteCodeBotAI`
+    instance, exactly like `self._queue` already does. `new_game` (see
+    `build_server`) replaces `active.bot_ai` with a brand new
+    `ExecuteCodeBotAI` (a fresh, empty `self._tasks`) and only swaps that
+    reference in after the OLD game's `game_task` has been cancelled and
+    fully awaited -- so by the time any tool call could observe the new
+    `active.bot_ai`, the old one's `on_step` loop is provably not running
+    anymore, and never will again (see `new_game`'s docstring in
+    `build_server` for why cancellation propagates a plain
+    `CancelledError` straight out of `on_step`, bypassing every branch
+    discussed above -- `_finish_task_turn` is never reached for a turn
+    caught mid-flight by a `new_game`-triggered cancellation, so that
+    turn, and the task it belonged to, simply stop existing along with
+    the old `ExecuteCodeBotAI` object itself, with nothing further to
+    clean up). Concretely: a task does NOT survive `new_game` -- its
+    `task_id` becomes unresolvable (`task_status` reports "unknown
+    task_id", the same way it would for a `task_id` that was never
+    registered at all) the moment a new game replaces the one the task
+    belonged to, with no special-casing required anywhere in this
+    mechanism beyond what `new_game`/`_ActiveGame` already do for an
+    ordinary in-flight `execute_code` call.
+
 ### `DEFAULT_MAP`
 
 ```python
@@ -886,6 +1104,30 @@ DEFAULT_MAP = 'AutomatonLE'
 ```
 
 Same fixed test map the rest of the project's harnesses default to.
+
+### `DEFAULT_SNIPPET_TIMEOUT_SECONDS`
+
+```python
+DEFAULT_SNIPPET_TIMEOUT_SECONDS = 45.0
+```
+
+Default per-`execute_code`-call timeout (in seconds), used by `on_step`'s `asyncio.wait_for` around `_eval_snippet` -- see the module docstring's "Per-call timeout and single automatic retry" section for the full mechanism this guards. 45 seconds: generous enough (tens of seconds, not single-digit seconds) that an ordinary realtime resource-wait loop -- e.g. `while not sdk.can_afford(X): await bot._advance(22)` waiting for minerals to accumulate under normal income -- comfortably finishes well within it, while still bounding a genuinely wedged snippet (like the real incident this feature was built for: a supply-cap bug that turned an `await bot._advance(22)` loop into an infinite one) to under a minute times two attempts, instead of hanging `on_step` -- and therefore the whole game -- forever. A snippet known in advance to legitimately need longer than this (e.g. a genuinely slow-income minerals wait that can take upwards of a minute) should pass its own `timeout_seconds` to `execute_code` rather than raising this server-wide default, which would make every *other* call wait just as long before a real bug is ever detected. See `_GameConfig.snippet_timeout_seconds` for how this default is overridden per-server (`--snippet-timeout`) and persists across `new_game` calls.
+
+### `DEFAULT_TASK_MAX_ITERATIONS`
+
+```python
+DEFAULT_TASK_MAX_ITERATIONS = 1000
+```
+
+Default `start_task` `max_iterations` -- see the module docstring's "Standing background tasks" section for the overall mechanism. This bounds how many turns a background task will run before giving up as `"failed"` (exhausted) if its step code's trailing return value never evaluates truthy -- a backstop against a task whose goal is simply never reachable (e.g. a step-code bug that always reports "keep going", or a genuinely unreachable target like more depots than the map's supply cap allows) spinning forever, consuming one queued turn after another indefinitely. 1000 is deliberately generous: even a slow resource-bound goal like "Supply Depots until 30" (the module docstring's worked example) needs at most a few dozen turns, so 1000 leaves ample headroom for legitimately larger goals without meaningfully risking an actually-stuck task running "forever" in practice -- a caller with a goal it knows needs more turns than this can simply pass a larger `max_iterations` to `start_task` explicitly.
+
+### `DEFAULT_LOCKFILE_PATH`
+
+```python
+DEFAULT_LOCKFILE_PATH = Path(tempfile.gettempdir()) / 'sc2-sdk-mcp.lock'
+```
+
+Where this process records "I am the current sc2-sdk-mcp instance, and here are the SC2 client PID(s) I explicitly spawned" -- read by the next sc2-sdk-mcp startup's single-instance guard to find and clean up a stale prior instance. A namespaced file under the system temp dir: this project has no existing convention for its own local/runtime state (`install.paths` is about locating the SC2 *client* install, a different concern -- see this section's docstring above), so this is a reasonable default rather than inventing a project-specific state directory for one small file.
 
 ### class `ExecuteCodeResult`
 
@@ -922,7 +1164,7 @@ waiting for an `on_step` call that will never come again.
 #### `ExecuteCodeBotAI.__init__`
 
 ```python
-def __init__(self) -> None
+def __init__(self, default_snippet_timeout_seconds: float=DEFAULT_SNIPPET_TIMEOUT_SECONDS) -> None
 ```
 
 #### `ExecuteCodeBotAI.on_start`
@@ -937,47 +1179,139 @@ async def on_start(self) -> None
 async def on_step(self, iteration: int) -> None
 ```
 
+#### `ExecuteCodeBotAI.start_task`
+
+```python
+def start_task(self, code: str, description: str, max_iterations: int=DEFAULT_TASK_MAX_ITERATIONS) -> str
+```
+
+Registers a new background task and enqueues its first turn --
+see the `start_task` MCP tool (in `build_server`) for the
+caller-facing contract, and the module docstring's "Standing
+background tasks" section for the overall mechanism. Synchronous
+and non-blocking (no `await` anywhere in this method): the queue
+put is a `put_nowait` (see `_enqueue_task_turn`), so this returns
+to its caller -- the `start_task` MCP tool, which does nothing
+else after this call but package the `task_id` into its response
+-- before the first turn has even had a chance to run, let alone
+the whole goal complete.
+
+#### `ExecuteCodeBotAI.cancel_task`
+
+```python
+def cancel_task(self, task_id: str) -> dict[str, object]
+```
+
+Requests that `task_id` stop scheduling further turns -- see the
+`cancel_task` MCP tool (in `build_server`) for the caller-facing
+contract. Only ever sets a flag (`_TaskState.cancel_requested`);
+never touches `self._queue` or attempts to interrupt a turn
+that's already running or already queued -- see `_finish_task_turn`'s
+docstring for why checking the flag between turns is sufficient
+and correct, and the module docstring's "Standing background
+tasks" section for why interrupting an in-flight turn is
+deliberately out of scope.
+
+#### `ExecuteCodeBotAI.list_task_ids`
+
+```python
+def list_task_ids(self) -> 'list[str]'
+```
+
+Every `task_id` currently registered against this game instance,
+in registration order -- backs `task_status()`'s no-argument
+"list everything" form (see `build_server`). A thin, read-only view
+over `self._tasks`'s keys (a `dict`, so insertion order is already
+preserved) rather than exposing `self._tasks` itself, keeping this
+class's internal bookkeeping structure private to it.
+
+#### `ExecuteCodeBotAI.task_status`
+
+```python
+def task_status(self, task_id: str) -> dict[str, object]
+```
+
+Snapshots `task_id`'s current bookkeeping into a plain dict --
+see the `task_status` MCP tool (in `build_server`) for the
+caller-facing contract. Called fresh on every invocation (no
+caching): `self._tasks[task_id]` is mutated in place by
+`_finish_task_turn` as each turn completes, so this always reflects
+genuinely current progress, including while the task is still
+`"running"` -- not just a snapshot taken once at `start_task` time
+or only once the task finishes.
+
 #### `ExecuteCodeBotAI.submit`
 
 ```python
-async def submit(self, code: str) -> ExecuteCodeResult
+async def submit(self, code: str, timeout_seconds: float | None=None) -> ExecuteCodeResult
 ```
 
 Called by the `execute_code` MCP tool handler: enqueue `code`
 for the next `on_step` to run, and wait for its result -- or for a
 clear error if the match ends before that happens.
 
+`timeout_seconds`, if given, overrides `self.default_snippet_timeout_seconds`
+for this call only -- resolved to a concrete float right here, once,
+and carried on the `_PendingRequest` (see its docstring for why),
+so a first-timeout retry (see `on_step`) reuses this same call's
+chosen timeout rather than re-resolving against the server default.
+
 ### class `ExecuteCodeSession`
 
 What `serve_execute_code()` hands back: the live `FastMCP` server
-plus the live `ExecuteCodeBotAI`/game task it's wired to, so a caller
-(a console-script entrypoint, or a test) can both serve the MCP tool
-and separately inspect/await the underlying game.
+plus the `_ActiveGame` it's wired to, so a caller (a console-script
+entrypoint, or a test) can both serve the MCP tool and separately
+inspect/await the underlying game.
+
+`bot_ai`/`game_task` are properties, not plain fields, proxying
+through `active`: after a caller invokes the `new_game` tool (see
+`build_server`), `active.bot_ai`/`active.game_task` get reassigned to
+the new game -- these properties make `session.bot_ai`/
+`session.game_task` always reflect "whichever game is current", the
+same thing `execute_code` itself now talks to, rather than freezing at
+whatever game existed when this session was first constructed.
 
 **Fields:**
 
 - `mcp: FastMCP`
-- `bot_ai: ExecuteCodeBotAI`
-- `game_task: 'asyncio.Task[Result]'`
+- `active: _ActiveGame`
+
+#### `ExecuteCodeSession.bot_ai`
+
+```python
+@property
+def bot_ai(self) -> ExecuteCodeBotAI
+```
+
+#### `ExecuteCodeSession.game_task`
+
+```python
+@property
+def game_task(self) -> 'asyncio.Task[Result]'
+```
 
 ### `build_server`
 
 ```python
-def build_server(bot_ai: ExecuteCodeBotAI, name: str='sc2-sdk') -> FastMCP
+def build_server(active: _ActiveGame, defaults: _GameConfig, name: str='sc2-sdk') -> FastMCP
 ```
 
-Build a `FastMCP` server exposing the single `execute_code` tool
-against `bot_ai`. Split out from `serve_execute_code()` purely as a
-seam: it only touches `bot_ai.ready`/`bot_ai.submit()`, not anything
-SC2-specific, so nothing about wiring the MCP tool itself depends on
-`bot_ai` being a real, game-backed `ExecuteCodeBotAI` -- see
-`serve_execute_code()` below for how the real entrypoint constructs
-one.
+Build a `FastMCP` server exposing `execute_code`, `new_game`, and
+the standing-background-task trio `start_task`/`task_status`/
+`cancel_task` (see the module docstring's "Standing background tasks"
+section) against `active` -- all tools are defined once here and
+read/write `active.bot_ai`/`active.game_task` at call time rather than
+closing over a value fixed at construction time, so `new_game` can
+swap the game every other tool talks to without rebuilding this server
+(see `_ActiveGame`'s docstring for why that indirection is needed at
+all). Nothing about wiring any of these tools depends on `active.bot_ai`
+being a real, game-backed `ExecuteCodeBotAI` -- see `serve_execute_code()`
+below for how the real entrypoint constructs one.
 
 ### `serve_execute_code`
 
 ```python
-async def serve_execute_code(map_name: str=DEFAULT_MAP, my_race: Race=Race.Terran, opponent_race: Race=Race.Random, difficulty: Difficulty=Difficulty.Easy, game_time_limit: int | None=None, realtime: bool=False) -> ExecuteCodeSession
+async def serve_execute_code(map_name: str=DEFAULT_MAP, my_race: Race=Race.Terran, opponent_race: Race=Race.Random, difficulty: Difficulty=Difficulty.Easy, game_time_limit: int | None=None, realtime: bool=False, snippet_timeout_seconds: float=DEFAULT_SNIPPET_TIMEOUT_SECONDS) -> ExecuteCodeSession
 ```
 
 Launch a real game against the built-in AI -- stepped (paused
@@ -1007,6 +1341,13 @@ def main(argv: list[str] | None=None) -> None
 Console-script entrypoint (`sc2-sdk-mcp`, see pyproject.toml):
 launch a real game against the built-in AI and serve `execute_code`
 over stdio for a real MCP client (e.g. an LLM coding agent) to drive.
+
+Runs `_run_single_instance_guard()` first, before parsing anything else
+into a running game or serving any MCP traffic -- see this module's
+"Single-instance guard + explicit SC2-client PID tracking" section for
+why this exists: a stale prior `sc2-sdk-mcp` process (and its own SC2
+client) left running from an earlier `/mcp` reconnect is found and
+terminated here, synchronously, before this process does anything else.
 
 ## `sdk.join`
 

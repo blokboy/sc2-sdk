@@ -17,6 +17,15 @@ dependencies = [
     # 1.x's mcp.server.fastmcp.FastMCP is the well-established, documented
     # surface this module is built against.
     "mcp>=1.2.0,<2.0.0",
+    # Used directly by src/sdk/mcp_server.py's single-instance guard (see
+    # that module's "Single-instance guard + explicit SC2-client PID
+    # tracking" section) for liveness/identity checks on recorded PIDs
+    # before terminating them. Was already present transitively (via
+    # portpicker, a burnysc2 dependency), but is listed here explicitly now
+    # that this project imports it directly -- relying on an unpinned
+    # transitive dependency for a runtime `import psutil` would be fragile
+    # if that transitive chain ever changes.
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]
