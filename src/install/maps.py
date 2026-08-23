@@ -1,16 +1,23 @@
-"""Sync the small, fixed map pool this project's tests and scripts run on.
+"""Sync the fixed map pool this project's tests and scripts run on.
 
 Source: Blizzard's official "Ladder2019Season1" map pack, listed under the
 "Map Packs" section of https://github.com/Blizzard/s2client-proto#downloads.
 Verified (by downloading and listing it while writing this module) to
-contain, among others:
+contain exactly these seven maps, nothing more:
 
     AutomatonLE.SC2Map        (~0.9 MB)
+    CyberForestLE.SC2Map      (~1.1 MB)
     KairosJunctionLE.SC2Map   (~1.4 MB)
+    KingsCoveLE.SC2Map        (~1.4 MB)
+    NewRepugnancyLE.SC2Map    (~1.4 MB)
+    PortAleksanderLE.SC2Map   (~1.4 MB)
+    YearZeroLE.SC2Map         (~1.6 MB)
 
-Both are standard, small, reliable ladder maps commonly used by python-sc2's
-own test/example suite. AutomatonLE is this project's primary fixed test map;
-KairosJunctionLE is kept as a documented fallback/second map.
+All seven are standard, small, reliable ladder maps from the same season's
+pool. AutomatonLE is this project's primary fixed test map; KairosJunctionLE
+is kept as the documented fallback/second map used by the integration
+harness; the rest sync alongside them so any map name in the pack is
+playable without a one-off `--maps` override.
 """
 
 from __future__ import annotations
@@ -26,8 +33,18 @@ _MAP_PACK_URL = "http://blzdistsc2-a.akamaihd.net/MapPacks/Ladder2019Season1.zip
 _MAP_PACK_PASSWORD = b"iagreetotheeula"
 
 #: Map names (matching sc2.maps.get()'s lookup, i.e. the .SC2Map stem) this
-#: project's setup syncs and its integration harness runs on.
-DEFAULT_MAPS = ("AutomatonLE", "KairosJunctionLE")
+#: project's setup syncs. AutomatonLE/KairosJunctionLE are what the
+#: integration harness actually runs on; the rest are the pack's remaining
+#: maps, synced too so they're playable out of the box.
+DEFAULT_MAPS = (
+    "AutomatonLE",
+    "KairosJunctionLE",
+    "CyberForestLE",
+    "KingsCoveLE",
+    "NewRepugnancyLE",
+    "PortAleksanderLE",
+    "YearZeroLE",
+)
 
 
 def _download(url: str) -> bytes:

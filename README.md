@@ -15,6 +15,23 @@ runtime (ticket #7) is the third play modality, built on the same `bot.*`/
 [full spec](https://github.com/blokboy/sc2-sdk/issues/1) for how all three
 fit together.
 
+## Setup with a coding agent
+
+If you're working through a coding agent (Claude Code, or anything else
+that reads `AGENTS.md`), skip the manual steps below entirely: clone the
+repo, open it with your agent, and just ask it to set up sc2-sdk. `AGENTS.md`
+is written as directions for the agent, not you -- it walks the agent
+through creating the venv, installing the SDK, running `sc2-sdk-setup` to
+get a client and map pool, and confirming the client is connected, telling
+you what it's doing and the result along the way. It'll also check with you
+before installing Tailscale, since that's only needed for cross-machine 1v1
+(see "Play a 1v1 with another agent" below) and not everyone wants
+networking software installed for a local session.
+
+The rest of this section, and "Get a local SC2 client + map pool" below,
+is the manual path -- for running it yourself, or if your tooling doesn't
+read `AGENTS.md`.
+
 ## Install
 
 ```bash
@@ -62,14 +79,19 @@ the `export SC2PATH=...` line to run in that case.
 
 ## Map pool
 
-Fixed set synced by `setup` (`install/maps.py:DEFAULT_MAPS`):
+Fixed set synced by `setup` (`install/maps.py:DEFAULT_MAPS`) -- all seven
+maps in Blizzard's official `Ladder2019Season1` map pack (same
+`s2client-proto#downloads` page, "Map Packs" section):
 
 - `AutomatonLE` -- primary test map
-- `KairosJunctionLE` -- secondary map
+- `KairosJunctionLE` -- secondary map, used by the integration harness
+- `CyberForestLE`
+- `KingsCoveLE`
+- `NewRepugnancyLE`
+- `PortAleksanderLE`
+- `YearZeroLE`
 
-Both are standard, small ladder maps, sourced from Blizzard's official
-`Ladder2019Season1` map pack (same `s2client-proto#downloads` page, "Map
-Packs" section).
+Pass `--maps` to `sc2-sdk-setup` to sync a different subset instead.
 
 ## Play a raw game against the built-in AI
 

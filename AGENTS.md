@@ -4,11 +4,21 @@ Read this file first, before anything else, when starting work in this repo.
 
 ## Get running
 
+Run this yourself at the start of any session in this repo -- don't make
+the user type it. Narrate what you're doing as you go (e.g. "no `.venv`
+found, creating one and installing the SDK..." or "`.venv` already exists,
+reusing it") so the user can follow along.
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+[ -d .venv ] || python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 sc2-sdk-setup
 ```
+
+The venv check makes this safe to re-run: an existing `.venv` is reused,
+not recreated, and `pip install`/`sc2-sdk-setup` are both cheap no-ops when
+already up to date.
 
 `sc2-sdk-setup` finds an existing Battle.net-managed client, or (on Linux)
 downloads and extracts Blizzard's official headless package, then syncs the
@@ -21,13 +31,22 @@ If it printed an `export SC2PATH=...` line (only happens with a non-default
 
 ## Confirm you're connection-ready
 
+Run this yourself too, right after "Get running" -- don't leave the user
+wondering whether setup actually worked.
+
 ```bash
 pytest -m "not integration"   # fast unit/tooling tests -- should pass regardless of client install
 pytest -m integration         # real-game tests -- skip cleanly with no client, run for real otherwise
 ```
 
-If `pytest -m integration` runs instead of skipping, and passes, you have a
-working, connected client and are ready to play.
+Report the outcome plainly:
+
+- `pytest -m integration` ran (not skipped) and passed -- tell the user
+  they have a working, connected client and are ready to play.
+- it skipped -- tell the user no client was found, and point them at
+  whatever actionable message `sc2-sdk-setup` printed above.
+- either command failed outright -- surface the failure; don't guess at a
+  fix or re-run setup speculatively.
 
 ## Then start playing
 
@@ -35,6 +54,17 @@ See README.md for the play modes (raw connect-and-play, the verified
 `bot.*`/`sdk.*` action API, interactive MCP `execute_code`, autonomous bot
 scripts) and pick whichever matches the task at hand. Don't re-derive
 install/setup steps from there -- this file is the canonical first step.
+
+One mode is not covered by "Get running" above and needs its own ask:
+`sc2-sdk-host`/`sc2-sdk-join` (cross-machine 1v1, ticket #12) will, if no
+Tailscale IP is already present, open a browser to Tailscale's download
+page and wait for the user to install and log in (`install/tailscale.py`).
+That's real networking software landing on the user's machine, for a
+project that otherwise never touches the network -- get explicit
+confirmation before running host/join, don't just launch it because the
+user mentioned playing against another machine or another agent. Every
+other play mode (raw, verified-action, MCP, autonomous bot, self-play) is
+local-only and doesn't need this.
 
 ## Also read
 
