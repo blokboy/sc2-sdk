@@ -202,7 +202,10 @@ the live game. The rest of this section is the one-time wiring step, not
 something you repeat per game.
 
 Point any MCP client at it (e.g. add it as a stdio MCP server in your
-agent's config) and call `execute_code` with a Python snippet -- it runs
+agent's config -- copy `.mcp.json.example` to `.mcp.json` and adjust the
+race/difficulty/map flags as needed; `.mcp.json` itself is gitignored
+since it's per-clone config, not something to commit) and call
+`execute_code` with a Python snippet -- it runs
 against live `bot`/`sdk` globals bound to the running game, exactly like a
 direct call from a `VerifiedBotAI.on_step` would:
 

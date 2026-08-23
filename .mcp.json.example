@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "sc2-sdk": {
+      "command": ".venv/bin/sc2-sdk-mcp",
+      "args": [
+        "--race",
+        "terran",
+        "--opponent-race",
+        "zerg",
+        "--difficulty",
+        "easy",
+        "--time-limit",
+        "1200",
+        "--realtime"
+      ]
+    }
+  }
+}
