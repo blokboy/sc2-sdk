@@ -103,6 +103,14 @@ Prints `RESULT: Victory|Defeat|Tie` and exits 0 once the game resolves. See
 `python -m sdk.play -h` for all options (race, opponent race, difficulty,
 `--realtime`, `--time-limit`).
 
+Or, if you're working through a coding agent, skip the flags and just ask:
+
+> Play a quick game as Terran against an easy built-in AI on Automaton, and
+> tell me who won.
+
+The agent runs the command above (or the programmatic form below) itself
+and reports back the result.
+
 Programmatically:
 
 ```python
@@ -140,6 +148,16 @@ class MyBot(VerifiedBotAI):
 result = run_bot_vs_builtin_ai(MyBot(), my_race=Race.Terran, difficulty=Difficulty.Easy)
 ```
 
+Or, just ask your agent:
+
+> Write and run a Terran bot that opens by training an SCV, using the
+> verified `bot.*` API, against an easy built-in AI.
+
+The agent writes a `VerifiedBotAI` subclass like the one above and runs it
+with `run_bot_vs_builtin_ai` itself, reporting each action's outcome
+(`ok`/`effect_confirmed`/`error`) as it goes rather than just the final
+result.
+
 - **`bot.*`** (`sdk.bot.Bot`, reached via `self.bot` inside your `BotAI`
   subclass): `observe()`, `train()`, `build()`, `research()`, `move()`,
   `attack_move()`, `chat()`. Each write action re-observes real subsequent
@@ -175,6 +193,13 @@ and the standing-background-task trio `start_task`/`task_status`/
 ```bash
 sc2-sdk-mcp
 ```
+
+This is the mode that makes "just tell your agent what to do, turn by
+turn" work: once it's wired up, you don't call `execute_code` yourself --
+you talk to your agent directly (e.g. "get an SCV out and start scouting
+the enemy natural") and it turns that into `execute_code` calls against
+the live game. The rest of this section is the one-time wiring step, not
+something you repeat per game.
 
 Point any MCP client at it (e.g. add it as a stdio MCP server in your
 agent's config) and call `execute_code` with a Python snippet -- it runs
@@ -416,6 +441,14 @@ the script responds instead (useful for CI). See `sc2-sdk-run-bot -h` for
 all options (map, race, opponent race, difficulty, `--time-limit`,
 `--bots-dir` to point at a different directory of scripts).
 
+Or, just ask your agent:
+
+> Write a bot script under `bots/` that opens with an SCV, and run it as
+> Terran against a Zerg built-in AI.
+
+The agent writes the `bots/<name>.py` file, then runs the command above
+(or the programmatic form below) itself and reports the result.
+
 Programmatically:
 
 ```python
@@ -469,6 +502,12 @@ unattended in real time; pass `--realtime` to run at wall-clock speed
 instead. See `sc2-sdk-selfplay -h` for all options (map, `--race-a`/
 `--race-b`, `--time-limit`, `--bots-dir`).
 
+Or, just ask your agent:
+
+> Have bots/idle_example.py play against itself and tell me both results.
+
+The agent runs `sc2-sdk-selfplay` itself and reports both sides' outcomes.
+
 Programmatically, drive two already-constructed `BotAI` instances directly
 with the runtime primitive (no script-loading involved -- pair it with
 `sdk.script_runner.load_bot_class`/`resolve_script_path` if you're starting
@@ -512,6 +551,17 @@ sc2-sdk-host bots/idle_example.py --race terran
 # Join side (paste the code from the host):
 sc2-sdk-join <code> bots/idle_example.py --race zerg
 ```
+
+Or, on the hosting side, just ask your agent:
+
+> Host a 1v1 against my friend on Automaton, playing Terran, and give me a
+> code to send them.
+
+The agent runs `sc2-sdk-host` itself and hands you the printed match code
+to share -- but per `AGENTS.md`, it should confirm with you first if no
+Tailscale IP is already set up, since that means installing networking
+software rather than just launching a game. Your friend's side is the
+same ask, pointed at `sc2-sdk-join` with the code you send them.
 
 - **Networking is not built or operated by this project.** `--host-ip` must
   already be reachable from the joiner's machine -- same network, or a VPN/
