@@ -1097,6 +1097,91 @@ already drains one at a time:
     mechanism beyond what `new_game`/`_ActiveGame` already do for an
     ordinary in-flight `execute_code` call.
 
+Hosting a two-player match: `host_game`/`host_status`
+-------------------------------------------------------
+Ticket #15 (https://github.com/blokboy/sc2-sdk/issues/15): lets an LLM host
+a real two-player match from inside an interactive `sc2-sdk-mcp` session --
+another `sc2-sdk-mcp` session (or the standalone `sc2-sdk-join` CLI) can then
+join it -- instead of only via the standalone `sc2-sdk-host` CLI script
+(`sdk.host_join`), which requires a whole separate bot script and never
+exposes the live `execute_code`/`start_task` tools this module already has.
+
+Built on the already-proven pieces, not new protocol work: `sdk.join`'s
+`_run_host_role` (ticket #11's proven host_ip-aware join primitive, already
+extended with an optional `join_timeout` for ticket #12) and `sdk.matchcode`
+(the shareable code format). Neither of those modules is touched here --
+both carry their own "kept separate/untouched" ground rules (see their
+docstrings), and nothing this feature needs requires changing either:
+
+  - **Defaulting `host_ip` to loopback, not Tailscale.** `sdk.host_join`'s
+    CLI auto-detects (or offers to install) Tailscale by default, because
+    genuinely separate machines is its whole point. This feature's current
+    scope (see the project's tracked tickets) is same-machine, two-LLM
+    play -- reaching for Tailscale auto-detection here would risk an
+    unwanted install prompt for a match that never leaves the host machine.
+    `host_game`'s `host_ip` defaults to `"127.0.0.1"` instead, plainly, with
+    no `install.tailscale` involvement at all; a caller who already knows a
+    real routable address (LAN, Tailscale, whatever) can still pass it
+    explicitly -- `host_ip` is just a string, unchanged from `_run_host_role`'s
+    own signature.
+  - **Realtime is not a `host_game` option -- it's forced on.** Single-player
+    `execute_code` mode gets its "paused between calls" feel for free
+    because there's only one client to hold still (see this module's
+    top-level docstring). Once a second, independently-paced client is
+    synchronized into the same match, there is no shared pause to hold: the
+    SC2 engine's stepping is a per-connection request, but the match
+    simulation itself is shared. So `_launch_hosted_game` (below) always
+    passes `realtime=True` to `_run_host_role`, unconditionally -- this is
+    not a caller-configurable default the way `new_game`'s `realtime`
+    argument is, because "stepped" was never a real option here to begin
+    with, not merely a worse one.
+  - **`host_game` returns immediately; `host_status` is polled** -- the
+    exact same shape `start_task`/`task_status` already established above
+    for "kick off something that may take a while, then check back": a
+    human relaying a match code between two chat sessions is exactly the
+    kind of open-ended, human-timescale wait `start_task` was built for, so
+    this reuses that shape rather than inventing a second one. Concretely:
+    `_launch_hosted_game` schedules `_run_host_role`'s coroutine (which
+    itself blocks on `create_game`+`join_game` until a peer connects, then
+    runs the whole match to completion) as an `asyncio.Task` via
+    `asyncio.create_task`, exactly the way `_launch_game` already schedules
+    `_host_game`'s coroutine for a solo game against the built-in AI -- and
+    returns the match code to the caller without awaiting that task at all.
+    `host_status` reports one of three states, derived from state this
+    module already tracks for other reasons rather than a parallel state
+    machine: `"waiting"` (the peer hasn't connected yet: `bot_ai.ready` --
+    the same event `execute_code` already awaits per-call -- isn't set, and
+    the task hasn't finished either); `"joined"` (`bot_ai.ready` is set --
+    once the peer's engine handshake resolves, `_play_game_ai` starts
+    driving `ExecuteCodeBotAI.on_step`, which sets `ready` from `on_start`
+    exactly as it does for a solo game, so this needs no new signal); or
+    `"failed"` (the task finished without ever setting `ready` -- either a
+    join timeout, surfaced by `_run_host_role` raising `sdk.matchcode
+    .JoinTimeoutError`, which `_launch_hosted_game`'s own task wrapper
+    catches and records onto `_HostGameState.timed_out` before re-raising,
+    or some other launch failure). There is no `"timed_out"`-vs-`"failed"`
+    split in `host_status`'s public `status` field -- `_HostGameState.
+    timed_out` distinguishes them internally (a clearer `error` message for
+    the timeout case specifically), but both are simply "this host never
+    got matched" from a caller's point of view, and both are recovered from
+    identically: call `new_game` (see below) and try again.
+  - **An abandoned/unmatched host is torn down via `new_game`, not a new
+    cancel tool.** `new_game`'s existing contract is already "end whatever's
+    running outright, cancelling it, not waiting" -- exactly the semantics
+    needed to give up on a host nobody has joined yet, or to bail out before
+    the timeout elapses because the map/race was wrong. `new_game` and
+    `host_game` now share that teardown step (`_teardown_active_game`,
+    factored out of `new_game`'s body below) so there is exactly one place
+    "cancel whatever game is currently active" is implemented, used by every
+    way of starting a new one.
+  - **Race pins carry through the match code unchanged.** `host_game`'s
+    `opponent_race_pin` argument is embedded into the match code exactly
+    like `sc2-sdk-host --opponent-race-pin` already does (see
+    `sdk.matchcode.encode_match_code`/`resolve_race`) -- nothing on the
+    hosting side "resolves" this pin itself; it's informational for whoever
+    calls the *joining* side's own tool later (a separate ticket), the same
+    way it already is for the standalone `sc2-sdk-join` CLI today.
+
 ### `DEFAULT_MAP`
 
 ```python
