@@ -1349,6 +1349,12 @@ why this exists: a stale prior `sc2-sdk-mcp` process (and its own SC2
 client) left running from an earlier `/mcp` reconnect is found and
 terminated here, synchronously, before this process does anything else.
 
+The guard's lockfile path is `DEFAULT_LOCKFILE_PATH` unless `--multiplayer
+INSTANCE_ID` was passed, in which case it's scoped to that id instead
+(see `_lockfile_path_for`) -- letting two `--multiplayer`-launched
+instances (e.g. one hosting, one joining a two-LLM match on the same
+machine) coexist without either one's guard terminating the other.
+
 ## `sdk.join`
 
 *Source: [`src/sdk/join.py`](../src/sdk/join.py)*
