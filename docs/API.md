@@ -1182,6 +1182,47 @@ docstrings), and nothing this feature needs requires changing either:
     calls the *joining* side's own tool later (a separate ticket), the same
     way it already is for the standalone `sc2-sdk-join` CLI today.
 
+Joining a two-player match: `join_game`
+------------------------------------------
+Ticket #16 (https://github.com/blokboy/sc2-sdk/issues/16): the other half of
+"hosting a two-player match" above -- lets an LLM join a match another
+`host_game` call (or the standalone `sc2-sdk-host` CLI) is hosting, from
+inside an interactive `sc2-sdk-mcp` session. Built the same way `host_game`
+was: on `sdk.join`'s already-proven `_run_join_role` and `sdk.matchcode`'s
+already-proven code format, neither of which is touched here.
+
+  - **`join_game` blocks until connected, unlike `host_game`.** Hosting has
+    an open-ended, human-timescale wait baked in (relaying the code to
+    whoever's joining) that `start_task`/`host_status`-style polling exists
+    for. Joining doesn't: by the time an LLM calls `join_game`, the code
+    already exists and the host is already listening, so the wait is
+    bounded by local client startup + the engine handshake, not by a
+    human's pace. So `join_game` awaits the same `bot_ai.ready` event
+    `execute_code`/`new_game` already use as "the match has actually
+    started" -- raced against its own `game_task` (see
+    `_await_connected_or_failure`) so a join that never succeeds (bad code,
+    host gave up, host unreachable) reports a clear failure once
+    `_run_join_role`'s own `join_timeout` elapses, instead of blocking
+    `join_game` forever.
+  - **Realtime is forced on, race is resolved the same way the CLI does.**
+    `_launch_joined_game` always passes `realtime=True` to `_run_join_role`
+    (mirroring `host_game`'s reasoning exactly -- a joiner cannot be
+    "stepped" while the peer it's synchronized with is realtime). The
+    joining side's race is resolved via `sdk.matchcode.resolve_race`
+    exactly like `sdk.host_join.main_join` -- an explicit `race` argument
+    wins over the code's `race_pin`, which wins over `Race.Random`.
+  - **No `map_name`/`host_ip` parameters -- both come from the code.** The
+    host is authoritative over the map and its own address (see
+    `sdk.matchcode.MatchCode`); `join_game` only decodes what's already
+    there, the same way `sc2-sdk-join`'s CLI never takes a `--map` or
+    `--host-ip` of its own.
+  - **An invalid/undecodable code fails immediately and plainly.**
+    `decode_match_code` raising on garbage input is not wrapped or
+    special-cased -- consistent with `new_game`/`host_game` already letting
+    an unrecognized race name's `KeyError` propagate raw rather than adding
+    a parallel validation layer for input this project already treats as a
+    system boundary the caller is responsible for getting right.
+
 ### `DEFAULT_MAP`
 
 ```python

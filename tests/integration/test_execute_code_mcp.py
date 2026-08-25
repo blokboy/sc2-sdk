@@ -67,18 +67,20 @@ async def _run() -> None:
 
     async with create_connected_server_and_client_session(session.mcp) as client:
         tools = await client.list_tools()
-        # Seven tools now, not one: this server also exposes new_game, the
+        # Eight tools now, not one: this server also exposes new_game, the
         # standing-background-task trio start_task/task_status/cancel_task,
-        # and the host_game/host_status pair (see sdk/mcp_server.py's
-        # build_server) -- test_new_game_*/test_start_task_* below and
-        # tests/integration/test_host_game_mcp.py cover those tools' own
-        # behavior; this test's job is still just execute_code's wiring
-        # against the first game.
+        # the host_game/host_status pair, and join_game (see
+        # sdk/mcp_server.py's build_server) -- test_new_game_*/
+        # test_start_task_* below and tests/integration/
+        # test_host_game_mcp.py/test_join_game_mcp.py cover those tools'
+        # own behavior; this test's job is still just execute_code's
+        # wiring against the first game.
         assert sorted(t.name for t in tools.tools) == [
             "cancel_task",
             "execute_code",
             "host_game",
             "host_status",
+            "join_game",
             "new_game",
             "start_task",
             "task_status",
@@ -248,6 +250,7 @@ async def _run_new_game_starts_fresh() -> None:
             "execute_code",
             "host_game",
             "host_status",
+            "join_game",
             "new_game",
             "start_task",
             "task_status",
