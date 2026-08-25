@@ -121,28 +121,76 @@ you talk to your agent directly (e.g. "get an SCV out and start scouting
 the enemy natural") and it turns that into `execute_code` calls against
 the live game. 
 
-These can be solo or multiplayer. The multiplayer option requires a user to setup Tailscale, so they have a networking endpoint to point at. A returned invite code is given to whomever you'd like to play with/against.
+These can be solo or multiplayer. Two flavors of multiplayer exist:
+
+- **Two LLMs, one machine** -- no Tailscale, no extra setup. See "Two LLMs playing each other" below.
+- **Cross-machine**, against a second real machine -- needs Tailscale so the two sides have a networking endpoint to point at. See "Play a 1v1 with another agent" further down.
 
 **Agentic**:
 ```
 Let's run an MCP match.
 ```
-OR
-```
-Let's run an MCP multiplayer match.
-```
-
 
 **CLI**:
 ```bash
 sc2-sdk-mcp
 ```
 `sc2-sdk-mcp` (or `python -m sdk.mcp_server`) launches a real game against
-the built-in AI and serves five MCP tools -- `execute_code`, `new_game`,
-and the standing-background-task trio `start_task`/`task_status`/
-`cancel_task` (see below) -- over stdio:
+the built-in AI and serves eight MCP tools over stdio: `execute_code`,
+`new_game`, the standing-background-task trio `start_task`/`task_status`/
+`cancel_task`, and the two-LLM-multiplayer trio `host_game`/`host_status`/
+`join_game` covered next.
 
-OR
+### Two LLMs playing each other (same machine)
+
+Two separate agent sessions on one machine, each running its own
+`sc2-sdk-mcp`, playing a live match against each other -- no Tailscale, no
+cross-machine setup, nothing beyond what solo MCP play already needs.
+
+**Agentic** (say this to the hosting session):
+```
+Host a game as Terran on Automaton and give me the match code to share with the other agent.
+```
+Then paste the code it gives you into the *other* agent session:
+```
+Join the SC2 match with this code: <code>, and play as Zerg.
+```
+Both sessions then just play -- keep talking to each one turn by turn like
+any other MCP match.
+
+**CLI** (two terminals):
+```bash
+# Terminal 1 -- the host:
+sc2-sdk-mcp --multiplayer host
+
+# Terminal 2 -- the joiner:
+sc2-sdk-mcp --multiplayer join
+```
+The `--multiplayer INSTANCE_ID` flag is what lets two `sc2-sdk-mcp`
+processes coexist on one machine at all (see `mcp_server.py`'s
+single-instance-guard docs) -- omit it and the second process launched
+would terminate the first as a stale duplicate.
+
+From there, call `host_game` in the host session to get a match code, hand
+it to the joining session's `join_game`, and both are live once it returns.
+`host_status` (host side only) reports `"waiting"` until a peer connects,
+then `"joined"`.
+
+**Handing the code between two separate agent sessions is currently
+manual** -- copy it out of the host's transcript and paste it into the
+joiner's. Automating that handoff (so a user doesn't have to relay it by
+hand) is deliberately deferred, not forgotten.
+
+**Known limitation:** if nobody ever joins, `host_game`'s wait currently
+hangs instead of timing out cleanly -- tracked as
+[#18](https://github.com/blokboy/sc2-sdk/issues/18). Doesn't affect a match
+that actually connects.
+
+### Play a 1v1 with another agent (cross-machine)
+
+Same idea, but against a second real machine instead of a second session on
+this one -- each side runs its own standalone script (not MCP) and needs
+Tailscale so the two machines have a routable address to point at:
 
 ```bash
 # Host side:
