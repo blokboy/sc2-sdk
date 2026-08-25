@@ -526,6 +526,46 @@ _DIFFICULTY_BY_NAME = {d.name.lower(): d for d in Difficulty}
 #: small file.
 DEFAULT_LOCKFILE_PATH = Path(tempfile.gettempdir()) / "sc2-sdk-mcp.lock"
 
+
+def _lockfile_path_for(multiplayer_id: "str | None") -> Path:
+    """`DEFAULT_LOCKFILE_PATH` when `multiplayer_id` is `None` (ordinary
+    single-global-instance mode, completely unchanged) -- otherwise a path
+    scoped to `multiplayer_id` (see the `--multiplayer` CLI flag), so two
+    concurrently-launched `sc2-sdk-mcp --multiplayer` processes using two
+    *different* ids (e.g. one side hosting a two-LLM match, the other
+    joining it) each read/write their own lockfile and are structurally
+    invisible to each other's single-instance guard -- neither can ever
+    terminate the other as a "stale duplicate".
+
+    Deliberately keyed by a caller-supplied id, not e.g. this process's own
+    PID: the whole point of the lockfile is to let a *later* launch detect
+    and clean up an *earlier*, still-running one (see this module's
+    "Single-instance guard" section) -- something that only works if the
+    same logical instance (the same `--multiplayer` id, reconnecting) keeps
+    writing to the same path across launches. Keying by the new process's
+    own PID instead would give every launch a fresh path and silently
+    disable stale-instance cleanup entirely for `--multiplayer` mode, which
+    is the opposite of what this guard exists for.
+
+    `Path(multiplayer_id).name` strips any directory components a caller
+    might pass (e.g. accidentally including a `/`), so `multiplayer_id`
+    can only ever affect the lockfile's filename, never its directory."""
+    if multiplayer_id is None:
+        return DEFAULT_LOCKFILE_PATH
+    safe_id = Path(multiplayer_id).name
+    return DEFAULT_LOCKFILE_PATH.with_name(f"sc2-sdk-mcp.{safe_id}.lock")
+
+
+#: The lockfile path this process's single-instance guard actually claimed
+#: at startup (see `_run_single_instance_guard`) -- `DEFAULT_LOCKFILE_PATH`
+#: in ordinary (no `--multiplayer`) mode, or a `--multiplayer`-id-scoped
+#: path otherwise (see `_lockfile_path_for`). `_launch_game`'s
+#: `_track_sc2_pid`/`_untrack_sc2_pid` calls read this (not the
+#: `DEFAULT_LOCKFILE_PATH` constant directly) so a spawned SC2 client's PID
+#: is recorded into, and removed from, whichever lockfile this specific
+#: process is actually maintaining.
+_active_lockfile_path: Path = DEFAULT_LOCKFILE_PATH
+
 #: Substrings checked (via `in`) against a candidate process's `cmdline()`,
 #: joined with spaces, to decide "this is an sc2-sdk-mcp process" -- see
 #: `_is_sc2_sdk_mcp_process`. Covers both ways this project's entrypoint is
@@ -896,7 +936,17 @@ def _run_single_instance_guard(lockfile_path: Path = DEFAULT_LOCKFILE_PATH) -> N
     leave the next startup thinking there's a stale instance to clean up
     (harmless if it does -- `_terminate_stale_instance` would just find the
     recorded PID already dead and skip it -- but there is no reason to leave
-    stale-looking state behind when exiting normally)."""
+    stale-looking state behind when exiting normally).
+
+    `lockfile_path` defaults to `DEFAULT_LOCKFILE_PATH` (ordinary mode) but
+    `main()` passes a `--multiplayer`-id-scoped path instead when that flag
+    is set (see `_lockfile_path_for`); this function records whichever path
+    it was actually given into `_active_lockfile_path`, so later
+    `_track_sc2_pid`/`_untrack_sc2_pid` calls (from `_launch_game`, once a
+    game actually starts) read/write the same lockfile this guard claimed,
+    not always `DEFAULT_LOCKFILE_PATH`."""
+    global _active_lockfile_path
+    _active_lockfile_path = lockfile_path
     _terminate_stale_instance(lockfile_path, own_pid=os.getpid())
     _owned_sc2_pids.clear()
     _write_lockfile(lockfile_path, os.getpid(), _owned_sc2_pids)
@@ -1637,7 +1687,7 @@ def _launch_game(config: _GameConfig) -> tuple[ExecuteCodeBotAI, "asyncio.Task[R
 
     def _capture_sc2_pid(pid: int) -> None:
         bot_ai.sc2_pid = pid
-        _track_sc2_pid(pid, lockfile_path=DEFAULT_LOCKFILE_PATH)
+        _track_sc2_pid(pid, lockfile_path=_active_lockfile_path)
 
     global _pending_sc2_pid_capture
     _pending_sc2_pid_capture = _capture_sc2_pid
@@ -1986,7 +2036,7 @@ def build_server(active: _ActiveGame, defaults: _GameConfig, name: str = "sc2-sd
             # advertising a PID that's already dead -- see
             # _untrack_sc2_pid's docstring for why this is hygiene, not a
             # correctness requirement.
-            _untrack_sc2_pid(old_bot_ai.sc2_pid, lockfile_path=DEFAULT_LOCKFILE_PATH)
+            _untrack_sc2_pid(old_bot_ai.sc2_pid, lockfile_path=_active_lockfile_path)
 
             config = _GameConfig(
                 map_name=map_name if map_name is not None else defaults.map_name,
@@ -2153,6 +2203,21 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--multiplayer",
+        default=None,
+        metavar="INSTANCE_ID",
+        help=(
+            "Opt into a per-instance single-instance-guard lockfile scoped by INSTANCE_ID "
+            "(e.g. 'host' / 'join') instead of the default global lockfile, so two "
+            "concurrently-launched sc2-sdk-mcp processes for a two-LLM match on one machine "
+            "don't terminate each other as stale duplicates -- see _lockfile_path_for. "
+            "Relaunching with the SAME INSTANCE_ID still cleans up a stale prior instance "
+            "under that id, exactly like the default guard does; only DIFFERENT ids are "
+            "mutually invisible to each other. Omit for the default single-global-instance "
+            "behavior."
+        ),
+    )
+    parser.add_argument(
         "--snippet-timeout",
         type=float,
         default=DEFAULT_SNIPPET_TIMEOUT_SECONDS,
@@ -2195,9 +2260,15 @@ def main(argv: list[str] | None = None) -> None:
     "Single-instance guard + explicit SC2-client PID tracking" section for
     why this exists: a stale prior `sc2-sdk-mcp` process (and its own SC2
     client) left running from an earlier `/mcp` reconnect is found and
-    terminated here, synchronously, before this process does anything else."""
+    terminated here, synchronously, before this process does anything else.
+
+    The guard's lockfile path is `DEFAULT_LOCKFILE_PATH` unless `--multiplayer
+    INSTANCE_ID` was passed, in which case it's scoped to that id instead
+    (see `_lockfile_path_for`) -- letting two `--multiplayer`-launched
+    instances (e.g. one hosting, one joining a two-LLM match on the same
+    machine) coexist without either one's guard terminating the other."""
     args = _parse_args(argv)
-    _run_single_instance_guard()
+    _run_single_instance_guard(_lockfile_path_for(args.multiplayer))
     asyncio.run(_main_async(args))
 
 

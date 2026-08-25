@@ -39,8 +39,11 @@ import pytest
 
 from install.paths import BINARY_NAME, platform_name
 from sdk.mcp_server import (
+    DEFAULT_LOCKFILE_PATH,
     _is_sc2_sdk_mcp_process,
+    _lockfile_path_for,
     _looks_like_sc2_client_process,
+    _parse_args,
     _read_lockfile,
     _terminate_stale_instance,
     _write_lockfile,
@@ -290,3 +293,107 @@ def test_dead_recorded_sc2_pid_is_skipped_not_terminated(tmp_path: Path, stale_s
         _reap(stale_mcp)
         if sc2_dummy is not None:
             _reap(sc2_dummy)
+
+
+# ---------------------------------------------------------------------------
+# --multiplayer opt-in: per-instance lockfile scoping (ticket: "Multiplayer
+# opt-in flag for the single-instance guard"). See _lockfile_path_for's
+# docstring for why this is keyed by a caller-supplied id, not by PID.
+# ---------------------------------------------------------------------------
+
+
+def test_lockfile_path_for_default_is_unchanged() -> None:
+    assert _lockfile_path_for(None) == DEFAULT_LOCKFILE_PATH
+
+
+def test_lockfile_path_for_different_ids_are_distinct_paths() -> None:
+    host_path = _lockfile_path_for("host")
+    join_path = _lockfile_path_for("join")
+    assert host_path != join_path
+    assert host_path != DEFAULT_LOCKFILE_PATH
+    assert join_path != DEFAULT_LOCKFILE_PATH
+
+
+def test_lockfile_path_for_same_id_is_stable_across_calls() -> None:
+    """Same id -> same path every time -- required for a relaunch under the
+    same id (e.g. a harness reconnect) to find its own predecessor's
+    lockfile, exactly like the default guard does."""
+    assert _lockfile_path_for("host") == _lockfile_path_for("host")
+
+
+def test_lockfile_path_for_strips_directory_components() -> None:
+    """A multiplayer id containing path separators must not let the caller
+    point the lockfile outside the usual lockfile directory."""
+    path = _lockfile_path_for("../../etc/host")
+    assert path.parent == DEFAULT_LOCKFILE_PATH.parent
+    assert ".." not in path.name
+
+
+def test_parse_args_multiplayer_defaults_to_none() -> None:
+    args = _parse_args([])
+    assert args.multiplayer is None
+
+
+def test_parse_args_multiplayer_accepts_instance_id() -> None:
+    args = _parse_args(["--multiplayer", "host"])
+    assert args.multiplayer == "host"
+
+
+def test_multiplayer_instances_with_different_ids_do_not_cross_terminate(tmp_path: Path) -> None:
+    """(a)/(c) from the ticket: a process recorded stale under one
+    --multiplayer id's lockfile must not be touched by a guard run scoped
+    to a DIFFERENT id's lockfile -- proving two concurrently-launched
+    `sc2-sdk-mcp --multiplayer` instances (e.g. one hosting, one joining a
+    two-LLM match) can never terminate each other, because each only ever
+    reads its own lockfile path."""
+    host_lock = tmp_path / _lockfile_path_for("host").name
+    join_lock = tmp_path / _lockfile_path_for("join").name
+    host_stale = _spawn_dummy(_MCP_MARKER)
+    try:
+        _write_lockfile(host_lock, mcp_pid=host_stale.pid, sc2_pids=set())
+
+        # A "join" instance starting up only ever consults its OWN lockfile
+        # path -- it must never discover, let alone terminate, whatever is
+        # recorded under "host"'s.
+        report = _terminate_stale_instance(join_lock, own_pid=99999)
+
+        assert report["stale_mcp_pid"] is None
+        assert report["stale_mcp_terminated"] is False
+        assert host_stale.poll() is None  # still alive and untouched
+    finally:
+        _reap(host_stale)
+
+
+def test_default_mode_and_multiplayer_instance_do_not_cross_terminate(tmp_path: Path) -> None:
+    """A mix (one default-mode instance, one --multiplayer instance) must
+    not cross-terminate either, since they use different lockfile paths."""
+    default_lock = tmp_path / DEFAULT_LOCKFILE_PATH.name
+    multiplayer_lock = tmp_path / _lockfile_path_for("host").name
+    default_stale = _spawn_dummy(_MCP_MARKER)
+    try:
+        _write_lockfile(default_lock, mcp_pid=default_stale.pid, sc2_pids=set())
+
+        report = _terminate_stale_instance(multiplayer_lock, own_pid=99999)
+
+        assert report["stale_mcp_terminated"] is False
+        assert default_stale.poll() is None
+    finally:
+        _reap(default_stale)
+
+
+def test_reconnect_under_same_multiplayer_id_still_cleans_up_stale_instance(tmp_path: Path) -> None:
+    """A --multiplayer instance relaunched under the SAME id (e.g. the
+    harness restarting the host side after a reconnect) still gets the
+    ordinary stale-cleanup guarantee -- only DIFFERENT ids are mutually
+    invisible to each other, not same-id relaunches."""
+    host_lock = tmp_path / _lockfile_path_for("host").name
+    stale_host = _spawn_dummy(_MCP_MARKER)
+    try:
+        _write_lockfile(host_lock, mcp_pid=stale_host.pid, sc2_pids=set())
+
+        report = _terminate_stale_instance(host_lock, own_pid=99999)
+
+        assert report["stale_mcp_terminated"] is True
+        assert stale_host.wait(timeout=5) is not None
+    finally:
+        _reap(stale_host)
