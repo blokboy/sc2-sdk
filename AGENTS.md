@@ -31,22 +31,28 @@ If it printed an `export SC2PATH=...` line (only happens with a non-default
 
 ## Confirm you're connection-ready
 
-Run this yourself too, right after "Get running" -- don't leave the user
-wondering whether setup actually worked.
+Run the dedicated smoke test yourself right after "Get running" -- don't
+leave the user wondering whether setup actually worked.
 
 ```bash
-pytest -m "not integration"   # fast unit/tooling tests -- should pass regardless of client install
-pytest -m integration         # real-game tests -- skip cleanly with no client, run for real otherwise
+pytest -q tests/integration/test_connection_smoke.py
 ```
+
+This launches one real local game, advances it for one in-game second, and
+exits. It proves the client and primary map can actually connect without
+making every user run the repository's full test matrix. Do not run the full
+unit or integration suites as part of setup or before ordinary play; those
+are development/CI checks and should only be run when the task calls for
+them.
 
 Report the outcome plainly:
 
-- `pytest -m integration` ran (not skipped) and passed -- tell the user
-  they have a working, connected client and are ready to play.
+- the smoke test ran (not skipped) and passed -- tell the user they have a
+  working, connected client and are ready to play.
 - it skipped -- tell the user no client was found, and point them at
   whatever actionable message `sc2-sdk-setup` printed above.
-- either command failed outright -- surface the failure; don't guess at a
-  fix or re-run setup speculatively.
+- it failed outright -- surface the failure; don't guess at a fix or re-run
+  setup speculatively.
 
 ## Then start playing
 
