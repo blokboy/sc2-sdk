@@ -380,6 +380,47 @@ docstrings), and nothing this feature needs requires changing either:
     hosting side "resolves" this pin itself; it's informational for whoever
     calls the *joining* side's own tool later (a separate ticket), the same
     way it already is for the standalone `sc2-sdk-join` CLI today.
+
+Joining a two-player match: `join_game`
+------------------------------------------
+Ticket #16 (https://github.com/blokboy/sc2-sdk/issues/16): the other half of
+"hosting a two-player match" above -- lets an LLM join a match another
+`host_game` call (or the standalone `sc2-sdk-host` CLI) is hosting, from
+inside an interactive `sc2-sdk-mcp` session. Built the same way `host_game`
+was: on `sdk.join`'s already-proven `_run_join_role` and `sdk.matchcode`'s
+already-proven code format, neither of which is touched here.
+
+  - **`join_game` blocks until connected, unlike `host_game`.** Hosting has
+    an open-ended, human-timescale wait baked in (relaying the code to
+    whoever's joining) that `start_task`/`host_status`-style polling exists
+    for. Joining doesn't: by the time an LLM calls `join_game`, the code
+    already exists and the host is already listening, so the wait is
+    bounded by local client startup + the engine handshake, not by a
+    human's pace. So `join_game` awaits the same `bot_ai.ready` event
+    `execute_code`/`new_game` already use as "the match has actually
+    started" -- raced against its own `game_task` (see
+    `_await_connected_or_failure`) so a join that never succeeds (bad code,
+    host gave up, host unreachable) reports a clear failure once
+    `_run_join_role`'s own `join_timeout` elapses, instead of blocking
+    `join_game` forever.
+  - **Realtime is forced on, race is resolved the same way the CLI does.**
+    `_launch_joined_game` always passes `realtime=True` to `_run_join_role`
+    (mirroring `host_game`'s reasoning exactly -- a joiner cannot be
+    "stepped" while the peer it's synchronized with is realtime). The
+    joining side's race is resolved via `sdk.matchcode.resolve_race`
+    exactly like `sdk.host_join.main_join` -- an explicit `race` argument
+    wins over the code's `race_pin`, which wins over `Race.Random`.
+  - **No `map_name`/`host_ip` parameters -- both come from the code.** The
+    host is authoritative over the map and its own address (see
+    `sdk.matchcode.MatchCode`); `join_game` only decodes what's already
+    there, the same way `sc2-sdk-join`'s CLI never takes a `--map` or
+    `--host-ip` of its own.
+  - **An invalid/undecodable code fails immediately and plainly.**
+    `decode_match_code` raising on garbage input is not wrapped or
+    special-cased -- consistent with `new_game`/`host_game` already letting
+    an unrecognized race name's `KeyError` propagate raw rather than adding
+    a parallel validation layer for input this project already treats as a
+    system boundary the caller is responsible for getting right.
 """
 
 from __future__ import annotations
@@ -417,8 +458,8 @@ from mcp.server.fastmcp import FastMCP
 from install.paths import BINARY_NAME, platform_name
 from sdk.bot import VerifiedBotAI
 from sdk.host_join import DEFAULT_JOIN_TIMEOUT
-from sdk.join import _run_host_role  # noqa: SLF001 -- see this module's "Hosting a two-player match" section
-from sdk.matchcode import JoinTimeoutError, encode_match_code
+from sdk.join import _run_host_role, _run_join_role  # noqa: SLF001 -- see this module's "Hosting a two-player match" section
+from sdk.matchcode import JoinTimeoutError, decode_match_code, encode_match_code, resolve_race
 
 #: Same fixed test map the rest of the project's harnesses default to.
 DEFAULT_MAP = "AutomatonLE"
@@ -1916,6 +1957,97 @@ def _launch_hosted_game(
     return bot_ai, game_task, match_code
 
 
+def _launch_joined_game(
+    *,
+    host_ip: str,
+    portconfig: Portconfig,
+    map_name: str,
+    my_race: Race,
+    game_time_limit: "int | None",
+    snippet_timeout_seconds: float,
+    join_timeout: float,
+) -> tuple[ExecuteCodeBotAI, "asyncio.Task[Result]"]:
+    """The `join_game` MCP tool's counterpart to `_launch_hosted_game`:
+    construct one fresh `ExecuteCodeBotAI` and kick off a `game_task` that
+    connects to a match another side already created -- via
+    `sdk.join._run_join_role`, not `_run_host_role` -- so once connected,
+    this game is driven by the exact same `ExecuteCodeBotAI.on_step`
+    queue/`execute_code`/`start_task` machinery every other game in this
+    module already uses. See the module docstring's "Joining a two-player
+    match" section for the full design.
+
+    `map_name` is accepted only for the return value's own bookkeeping
+    (`join_game` reports what it connected to) -- `_run_join_role` itself
+    never needs it, since the map was already decided when the host called
+    `RequestCreateGame`; the joining side's engine resolves it from the
+    match state, not from anything passed here.
+
+    Unlike `_launch_hosted_game`, there is no `JoinTimeoutError`-specific
+    `except` here: `_await_connected_or_failure` (used by the `join_game`
+    tool) inspects `game_task`'s own exception directly once it finishes,
+    the same information `_host_status` reads from `_HostGameState.
+    timed_out` for the hosting side -- no parallel state needs recording on
+    `bot_ai` here since nothing polls a joined game's status the way
+    `host_status` polls a hosted one (see the module docstring for why
+    `join_game` blocks instead)."""
+    bot_ai = ExecuteCodeBotAI(default_snippet_timeout_seconds=snippet_timeout_seconds)
+    _install_sc2_pid_capture(bot_ai)
+
+    async def _run_and_track() -> Result:
+        # portconfig is this coroutine's to clean up -- mirrors
+        # sdk.host_join.main_join's own try/finally around the Portconfig
+        # decode_match_code handed it.
+        try:
+            return await _run_join_role(
+                my_race,
+                bot_ai,
+                portconfig,
+                host_ip,
+                True,  # realtime -- see the module docstring for why this is never a parameter
+                game_time_limit,
+                join_timeout=join_timeout,
+            )
+        finally:
+            portconfig.clean()
+
+    game_task = asyncio.create_task(_run_and_track())
+    bot_ai.game_task = game_task
+    return bot_ai, game_task
+
+
+async def _await_connected_or_failure(bot_ai: ExecuteCodeBotAI, game_task: "asyncio.Task[Result]") -> None:
+    """Blocks until either `bot_ai.ready` is set (the join succeeded and
+    the match has actually started -- the same event `execute_code`/
+    `new_game` already treat as "playable") or `game_task` finishes without
+    ever setting it (a join failure -- most commonly `sdk.matchcode.
+    JoinTimeoutError` from `_run_join_role`'s own `join_timeout`, but any
+    other launch failure ends up here the same way). Backs the `join_game`
+    tool's "blocks until connected" contract -- see the module docstring's
+    "Joining a two-player match" section for why this is a blocking wait
+    rather than `host_status`-style polling.
+
+    Mirrors `_host_status`'s state derivation (same two signals: `ready`
+    and whether `game_task` is done) but as a single blocking wait instead
+    of a repeatable snapshot, since nothing needs to poll a `join_game`
+    attempt's progress the way `host_status` polls a hosted one."""
+    ready_task = asyncio.ensure_future(bot_ai.ready.wait())
+    try:
+        await asyncio.wait({ready_task, game_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not ready_task.done():
+            ready_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ready_task
+
+    if bot_ai.ready.is_set():
+        return
+
+    exc = game_task.exception() if game_task.done() else None
+    if exc is not None:
+        raise exc
+    raise RuntimeError("Failed to join the match: the connection ended before the game started.")
+
+
 async def _teardown_active_game(active: _ActiveGame) -> bool:
     """Cancels `active`'s current `game_task` if it isn't already done, and
     untracks its SC2 client PID -- the "end whatever's running outright"
@@ -2449,6 +2581,79 @@ def build_server(active: _ActiveGame, defaults: _GameConfig, name: str = "sc2-sd
         check in on a wait that may still be ongoing without blocking on
         it."""
         return _host_status(active.bot_ai, active.game_task)
+
+    @mcp.tool()
+    async def join_game(
+        code: str,
+        race: str | None = None,
+        game_time_limit: int | None = None,
+        snippet_timeout_seconds: float | None = None,
+        join_timeout: float = DEFAULT_JOIN_TIMEOUT,
+    ) -> dict[str, object]:
+        """Join a match hosted by `host_game` (or the standalone
+        `sc2-sdk-host` CLI) and block until connected -- see the module
+        docstring's "Joining a two-player match" section for the full
+        design. Once this returns, the match is playable through the
+        existing `execute_code`/`start_task` tools exactly like any other
+        game this server serves.
+
+        Ends whatever game is currently active first, the same "cancel
+        outright, don't wait" teardown `new_game`/`host_game` already
+        perform (see `_teardown_active_game`).
+
+        `code` is a `host_game`/`sc2-sdk-host` match code -- decoded via
+        `sdk.matchcode.decode_match_code`, which raises directly (not
+        wrapped) on a garbage/undecodable string, per this module's
+        docstring on why that isn't given a parallel validation layer.
+
+        `race`, if given, wins over the code's own `race_pin`; omit it to
+        use the host's pin, or `Random` if the host didn't set one either
+        (see `sdk.matchcode.resolve_race`). There is no `map_name` or
+        `host_ip` parameter -- both come from `code`.
+
+        Realtime is not a parameter here, for the same reason it isn't on
+        `host_game`: a joiner cannot be "stepped" while synchronized with a
+        realtime peer.
+
+        `join_timeout` (default: `sdk.host_join.DEFAULT_JOIN_TIMEOUT`)
+        bounds how long this blocks waiting to connect before raising --
+        an invalid code, an unreachable host, or a host that already gave
+        up all surface as a raised error here rather than a hang, once
+        that timeout elapses.
+
+        Returns `{"host_ip": ..., "map_name": ..., "my_race": ...,
+        "join_timeout": ..., "previous_game_torn_down": ...}`."""
+        async with active.lock:
+            previous_game_torn_down = await _teardown_active_game(active)
+
+            decoded = decode_match_code(code)
+            requested_race = _RACE_BY_NAME[race] if race is not None else None
+            resolved_race = resolve_race(host_pin=decoded.race_pin, joiner_race=requested_race)
+            resolved_snippet_timeout = (
+                snippet_timeout_seconds if snippet_timeout_seconds is not None else defaults.snippet_timeout_seconds
+            )
+
+            new_bot_ai, new_game_task = _launch_joined_game(
+                host_ip=decoded.host_ip,
+                portconfig=decoded.portconfig,
+                map_name=decoded.map_name,
+                my_race=resolved_race,
+                game_time_limit=game_time_limit,
+                snippet_timeout_seconds=resolved_snippet_timeout,
+                join_timeout=join_timeout,
+            )
+            active.bot_ai = new_bot_ai
+            active.game_task = new_game_task
+
+        await _await_connected_or_failure(new_bot_ai, new_game_task)
+
+        return {
+            "host_ip": decoded.host_ip,
+            "map_name": decoded.map_name,
+            "my_race": resolved_race.name,
+            "join_timeout": join_timeout,
+            "previous_game_torn_down": previous_game_torn_down,
+        }
 
     return mcp
 
