@@ -68,9 +68,17 @@ page and wait for the user to install and log in (`install/tailscale.py`).
 That's real networking software landing on the user's machine, for a
 project that otherwise never touches the network -- get explicit
 confirmation before running host/join, don't just launch it because the
-user mentioned playing against another machine or another agent. Every
-other play mode (raw, verified-action, MCP, autonomous bot, self-play) is
-local-only and doesn't need this.
+user mentioned playing against another machine. Every other play mode
+(raw, verified-action, MCP, autonomous bot, self-play) is local-only and
+doesn't need this.
+
+This does **not** cover two LLMs playing each other on the same machine
+(`sc2-sdk-mcp --multiplayer` + the `host_game`/`join_game` MCP tools,
+ticket #17) -- that path defaults `host_ip` to loopback and never touches
+Tailscale, so it needs no special confirmation, same as any other local-
+only mode. The confirmation gate above returns, scoped specifically to
+whatever opts into Tailscale, once cross-machine multiplayer over MCP is
+built.
 
 ## Also read
 
