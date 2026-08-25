@@ -295,6 +295,91 @@ already drains one at a time:
     belonged to, with no special-casing required anywhere in this
     mechanism beyond what `new_game`/`_ActiveGame` already do for an
     ordinary in-flight `execute_code` call.
+
+Hosting a two-player match: `host_game`/`host_status`
+-------------------------------------------------------
+Ticket #15 (https://github.com/blokboy/sc2-sdk/issues/15): lets an LLM host
+a real two-player match from inside an interactive `sc2-sdk-mcp` session --
+another `sc2-sdk-mcp` session (or the standalone `sc2-sdk-join` CLI) can then
+join it -- instead of only via the standalone `sc2-sdk-host` CLI script
+(`sdk.host_join`), which requires a whole separate bot script and never
+exposes the live `execute_code`/`start_task` tools this module already has.
+
+Built on the already-proven pieces, not new protocol work: `sdk.join`'s
+`_run_host_role` (ticket #11's proven host_ip-aware join primitive, already
+extended with an optional `join_timeout` for ticket #12) and `sdk.matchcode`
+(the shareable code format). Neither of those modules is touched here --
+both carry their own "kept separate/untouched" ground rules (see their
+docstrings), and nothing this feature needs requires changing either:
+
+  - **Defaulting `host_ip` to loopback, not Tailscale.** `sdk.host_join`'s
+    CLI auto-detects (or offers to install) Tailscale by default, because
+    genuinely separate machines is its whole point. This feature's current
+    scope (see the project's tracked tickets) is same-machine, two-LLM
+    play -- reaching for Tailscale auto-detection here would risk an
+    unwanted install prompt for a match that never leaves the host machine.
+    `host_game`'s `host_ip` defaults to `"127.0.0.1"` instead, plainly, with
+    no `install.tailscale` involvement at all; a caller who already knows a
+    real routable address (LAN, Tailscale, whatever) can still pass it
+    explicitly -- `host_ip` is just a string, unchanged from `_run_host_role`'s
+    own signature.
+  - **Realtime is not a `host_game` option -- it's forced on.** Single-player
+    `execute_code` mode gets its "paused between calls" feel for free
+    because there's only one client to hold still (see this module's
+    top-level docstring). Once a second, independently-paced client is
+    synchronized into the same match, there is no shared pause to hold: the
+    SC2 engine's stepping is a per-connection request, but the match
+    simulation itself is shared. So `_launch_hosted_game` (below) always
+    passes `realtime=True` to `_run_host_role`, unconditionally -- this is
+    not a caller-configurable default the way `new_game`'s `realtime`
+    argument is, because "stepped" was never a real option here to begin
+    with, not merely a worse one.
+  - **`host_game` returns immediately; `host_status` is polled** -- the
+    exact same shape `start_task`/`task_status` already established above
+    for "kick off something that may take a while, then check back": a
+    human relaying a match code between two chat sessions is exactly the
+    kind of open-ended, human-timescale wait `start_task` was built for, so
+    this reuses that shape rather than inventing a second one. Concretely:
+    `_launch_hosted_game` schedules `_run_host_role`'s coroutine (which
+    itself blocks on `create_game`+`join_game` until a peer connects, then
+    runs the whole match to completion) as an `asyncio.Task` via
+    `asyncio.create_task`, exactly the way `_launch_game` already schedules
+    `_host_game`'s coroutine for a solo game against the built-in AI -- and
+    returns the match code to the caller without awaiting that task at all.
+    `host_status` reports one of three states, derived from state this
+    module already tracks for other reasons rather than a parallel state
+    machine: `"waiting"` (the peer hasn't connected yet: `bot_ai.ready` --
+    the same event `execute_code` already awaits per-call -- isn't set, and
+    the task hasn't finished either); `"joined"` (`bot_ai.ready` is set --
+    once the peer's engine handshake resolves, `_play_game_ai` starts
+    driving `ExecuteCodeBotAI.on_step`, which sets `ready` from `on_start`
+    exactly as it does for a solo game, so this needs no new signal); or
+    `"failed"` (the task finished without ever setting `ready` -- either a
+    join timeout, surfaced by `_run_host_role` raising `sdk.matchcode
+    .JoinTimeoutError`, which `_launch_hosted_game`'s own task wrapper
+    catches and records onto `_HostGameState.timed_out` before re-raising,
+    or some other launch failure). There is no `"timed_out"`-vs-`"failed"`
+    split in `host_status`'s public `status` field -- `_HostGameState.
+    timed_out` distinguishes them internally (a clearer `error` message for
+    the timeout case specifically), but both are simply "this host never
+    got matched" from a caller's point of view, and both are recovered from
+    identically: call `new_game` (see below) and try again.
+  - **An abandoned/unmatched host is torn down via `new_game`, not a new
+    cancel tool.** `new_game`'s existing contract is already "end whatever's
+    running outright, cancelling it, not waiting" -- exactly the semantics
+    needed to give up on a host nobody has joined yet, or to bail out before
+    the timeout elapses because the map/race was wrong. `new_game` and
+    `host_game` now share that teardown step (`_teardown_active_game`,
+    factored out of `new_game`'s body below) so there is exactly one place
+    "cancel whatever game is currently active" is implemented, used by every
+    way of starting a new one.
+  - **Race pins carry through the match code unchanged.** `host_game`'s
+    `opponent_race_pin` argument is embedded into the match code exactly
+    like `sc2-sdk-host --opponent-race-pin` already does (see
+    `sdk.matchcode.encode_match_code`/`resolve_race`) -- nothing on the
+    hosting side "resolves" this pin itself; it's informational for whoever
+    calls the *joining* side's own tool later (a separate ticket), the same
+    way it already is for the standalone `sc2-sdk-join` CLI today.
 """
 
 from __future__ import annotations
@@ -308,6 +393,7 @@ import dataclasses
 import io
 import json
 import os
+import secrets
 import tempfile
 import traceback
 from collections import deque
@@ -323,12 +409,16 @@ from sc2.data import Difficulty, Race, Result
 from sc2.main import _host_game  # noqa: SLF001 -- see module docstring
 from sc2.player import Bot as Sc2BotPlayer
 from sc2.player import Computer
+from sc2.portconfig import Portconfig
 from sc2.sc2process import SC2Process  # noqa: SLF001 -- see _patched_sc2process_launch's docstring below
 
 from mcp.server.fastmcp import FastMCP
 
 from install.paths import BINARY_NAME, platform_name
 from sdk.bot import VerifiedBotAI
+from sdk.host_join import DEFAULT_JOIN_TIMEOUT
+from sdk.join import _run_host_role  # noqa: SLF001 -- see this module's "Hosting a two-player match" section
+from sdk.matchcode import JoinTimeoutError, encode_match_code
 
 #: Same fixed test map the rest of the project's harnesses default to.
 DEFAULT_MAP = "AutomatonLE"
@@ -1252,6 +1342,29 @@ class _TaskState:
     log: "deque[str]" = dataclasses.field(default_factory=lambda: deque(maxlen=_TASK_LOG_MAX_ENTRIES))
 
 
+@dataclass
+class _HostGameState:
+    """Bookkeeping for one `host_game`-started hosted match, stored on the
+    `ExecuteCodeBotAI` it belongs to (`ExecuteCodeBotAI.host_state`) -- see
+    the module docstring's "Hosting a two-player match" section for the
+    overall design.
+
+    `match_code` is recorded here (rather than only ever handed back once,
+    in `host_game`'s own return value) so `host_status` can report it again
+    on every poll without the caller needing to have saved it separately.
+
+    `timed_out` starts `False` and is set exactly once, by the `game_task`
+    wrapper `_launch_hosted_game` builds, if `_run_host_role` raises
+    `sdk.matchcode.JoinTimeoutError` (no peer connected within the
+    configured `join_timeout`) -- see `_host_status` for how this
+    distinguishes "nobody ever joined" from any other way a hosted match's
+    `game_task` could end without `bot_ai.ready` ever having been set.
+    """
+
+    match_code: str
+    timed_out: bool = False
+
+
 class ExecuteCodeBotAI(VerifiedBotAI):
     """A `VerifiedBotAI` (see `bot.py`) whose `on_step` blocks on an
     external snippet queue instead of running a fixed scripted sequence --
@@ -1314,6 +1427,13 @@ class ExecuteCodeBotAI(VerifiedBotAI):
         #: useful here than a UUID's collision-resistance, which isn't
         #: needed at this scope.
         self._next_task_id: int = 1
+        #: Set by `_launch_hosted_game` (see the module docstring's
+        #: "Hosting a two-player match" section) for a game started via the
+        #: `host_game` MCP tool; `None` for every other kind of game
+        #: (solo-vs-built-in-AI via `new_game`/`_launch_game`) -- what
+        #: `host_status` checks to report a clear error instead of "waiting"
+        #: forever if it's called against a non-hosted game.
+        self.host_state: "_HostGameState | None" = None
 
     async def on_start(self) -> None:
         await super().on_start()
@@ -1658,6 +1778,33 @@ class ExecuteCodeSession:
         return self.active.game_task
 
 
+def _install_sc2_pid_capture(bot_ai: ExecuteCodeBotAI) -> None:
+    """Installs `bot_ai` as the target of `_pending_sc2_pid_capture` (see
+    that global's docstring for why a single module-level slot is safe
+    here) so that whenever the SC2 client this game is about to launch
+    actually calls `SC2Process._launch()`, `_patched_sc2process_launch`
+    records the real PID onto `bot_ai.sc2_pid` and into the single-instance
+    guard's lockfile (`_track_sc2_pid`) -- see this module's "Single-instance
+    guard + explicit SC2-client PID tracking" section for the full
+    mechanism and why it exists.
+
+    Shared by both `_launch_game` (solo-vs-built-in-AI, via `_host_game`)
+    and `_launch_hosted_game` (a `host_game`-started match, via
+    `_run_host_role` -- see the module docstring's "Hosting a two-player
+    match" section): both ultimately construct a `SC2Process` somewhere
+    inside the coroutine they schedule, and `_patched_sc2process_launch`'s
+    interception point doesn't care which caller's `SC2Process` it is --
+    only that exactly one `ExecuteCodeBotAI` is "pending capture" at the
+    moment it fires, which is true either way for the same reason
+    `_pending_sc2_pid_capture`'s docstring already gives."""
+    def _capture_sc2_pid(pid: int) -> None:
+        bot_ai.sc2_pid = pid
+        _track_sc2_pid(pid, lockfile_path=_active_lockfile_path)
+
+    global _pending_sc2_pid_capture
+    _pending_sc2_pid_capture = _capture_sc2_pid
+
+
 def _launch_game(config: _GameConfig) -> tuple[ExecuteCodeBotAI, "asyncio.Task[Result]"]:
     """Construct one fresh `ExecuteCodeBotAI` and kick off its `game_task`
     via `_host_game` -- the shared plumbing both `_build_session` (the
@@ -1675,22 +1822,10 @@ def _launch_game(config: _GameConfig) -> tuple[ExecuteCodeBotAI, "asyncio.Task[R
     routes back through here is what makes the timeout survive across
     `new_game` calls the same way `realtime`/`map_name`/etc. already do.
 
-    Also installs `bot_ai` as the target of `_pending_sc2_pid_capture`
-    (see that global's docstring for why a single module-level slot is
-    safe here) before scheduling the task, so that whenever this game's
-    `SC2Process._launch()` actually runs, `_patched_sc2process_launch`
-    records the real SC2 client PID onto `bot_ai.sc2_pid` and into the
-    single-instance guard's lockfile (`_track_sc2_pid`) -- see this
-    module's "Single-instance guard + explicit SC2-client PID tracking"
-    section for the full mechanism and why it exists."""
+    See `_install_sc2_pid_capture` for what installing the PID-capture
+    hook before scheduling the task accomplishes."""
     bot_ai = ExecuteCodeBotAI(default_snippet_timeout_seconds=config.snippet_timeout_seconds)
-
-    def _capture_sc2_pid(pid: int) -> None:
-        bot_ai.sc2_pid = pid
-        _track_sc2_pid(pid, lockfile_path=_active_lockfile_path)
-
-    global _pending_sc2_pid_capture
-    _pending_sc2_pid_capture = _capture_sc2_pid
+    _install_sc2_pid_capture(bot_ai)
 
     game_task = asyncio.create_task(
         _host_game(
@@ -1702,6 +1837,164 @@ def _launch_game(config: _GameConfig) -> tuple[ExecuteCodeBotAI, "asyncio.Task[R
     )
     bot_ai.game_task = game_task
     return bot_ai, game_task
+
+
+def _launch_hosted_game(
+    *,
+    map_name: str,
+    my_race: Race,
+    opponent_race_pin: "Race | None",
+    host_ip: str,
+    game_time_limit: "int | None",
+    snippet_timeout_seconds: float,
+    join_timeout: float,
+) -> tuple[ExecuteCodeBotAI, "asyncio.Task[Result]", str]:
+    """The `host_game` MCP tool's counterpart to `_launch_game`: construct
+    one fresh `ExecuteCodeBotAI`, generate and encode a shareable match
+    code, and kick off a `game_task` that creates the match, waits (up to
+    `join_timeout`) for a peer to join it, then plays it out -- via
+    `sdk.join._run_host_role`, not `_host_game` -- so once a peer connects,
+    this game is driven by the exact same `ExecuteCodeBotAI.on_step`
+    queue/`execute_code`/`start_task` machinery every other game in this
+    module already uses. See the module docstring's "Hosting a two-player
+    match" section for the full design this implements, including why
+    `realtime` is unconditionally `True` here (never a parameter) and why
+    `host_ip` defaults to loopback at the `host_game` tool layer, not here.
+
+    Returns `(bot_ai, game_task, match_code)` -- unlike `_launch_game`,
+    also handing back the match code, since there is no other channel for
+    `host_game` (which does not wait for this task) to learn it.
+
+    `bot_ai.host_state` is set here (not left for a caller to set) so it's
+    never possible to observe a `bot_ai` with a live hosted `game_task` but
+    no `host_state` -- `host_status`'s "no hosted game is active" check
+    relies on that invariant.
+    """
+    bot_ai = ExecuteCodeBotAI(default_snippet_timeout_seconds=snippet_timeout_seconds)
+    _install_sc2_pid_capture(bot_ai)
+
+    portconfig = Portconfig()
+    match_code = encode_match_code(
+        host_ip=host_ip,
+        portconfig=portconfig,
+        map_name=map_name,
+        race_pin=opponent_race_pin,
+        token=secrets.token_urlsafe(16),
+    )
+    bot_ai.host_state = _HostGameState(match_code=match_code)
+
+    async def _run_and_track() -> Result:
+        # portconfig is this coroutine's to clean up -- mirrors
+        # sdk.host_join.main_host's own try/finally around the same
+        # Portconfig() it constructs, since that's the other (and, until
+        # now, only) caller responsible for one of these.
+        try:
+            return await _run_host_role(
+                map_name,
+                my_race,
+                bot_ai,
+                portconfig,
+                host_ip,
+                True,  # realtime -- see the module docstring for why this is never a parameter
+                game_time_limit,
+                join_timeout=join_timeout,
+            )
+        except JoinTimeoutError:
+            # See _HostGameState's docstring: recorded so host_status can
+            # report a specific, clear reason rather than a generic
+            # "the host task ended" failure. Re-raised (not swallowed) so
+            # this task's own .exception()/.cancelled() reflect what
+            # actually happened, the same as any other game_task failure
+            # mode this module already lets propagate that way.
+            bot_ai.host_state.timed_out = True
+            raise
+        finally:
+            portconfig.clean()
+
+    game_task = asyncio.create_task(_run_and_track())
+    bot_ai.game_task = game_task
+    return bot_ai, game_task, match_code
+
+
+async def _teardown_active_game(active: _ActiveGame) -> bool:
+    """Cancels `active`'s current `game_task` if it isn't already done, and
+    untracks its SC2 client PID -- the "end whatever's running outright"
+    step every way of starting a new game (`new_game`, `host_game`) shares.
+    Factored out of `new_game`'s body (see the module docstring's "Hosting
+    a two-player match" section for why) so there is exactly one place
+    this is implemented; callers are expected to hold `active.lock` around
+    this call, exactly as `new_game` already did before this was pulled
+    out of it.
+
+    Cancelling *immediately* rather than waiting for any in-flight
+    `execute_code` snippet to finish first is deliberate -- see `new_game`'s
+    own docstring below for the full reasoning (recovering a session
+    wedged forever inside a runaway snippet is the other half of this
+    behavior's job, and that case, by construction, never resolves on its
+    own).
+
+    Returns whether a previous game was actually torn down (`False` if
+    `active.game_task` had already finished on its own before this call)."""
+    old_bot_ai = active.bot_ai
+    old_game_task = active.game_task
+    previous_game_torn_down = False
+    if not old_game_task.done():
+        old_game_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await old_game_task
+        previous_game_torn_down = True
+
+    # Whether old_game_task above was just cancelled or had already
+    # finished on its own before this call, the coroutine driving it
+    # (_host_game or _run_host_role) has now fully exited either way --
+    # its SC2 client is gone (via KillSwitch/__aexit__ cleanup; see this
+    # module's "Single-instance guard..." section on SIGINT-based cleanup
+    # normally working fine, it's only SIGTERM to a *stale* sc2-sdk-mcp
+    # process later that can't rely on this). Drop it from this process's
+    # own bookkeeping so the lockfile stops advertising a PID that's
+    # already dead -- see _untrack_sc2_pid's docstring for why this is
+    # hygiene, not a correctness requirement.
+    _untrack_sc2_pid(old_bot_ai.sc2_pid, lockfile_path=_active_lockfile_path)
+    return previous_game_torn_down
+
+
+def _host_status(bot_ai: ExecuteCodeBotAI, game_task: "asyncio.Task[Result]") -> dict[str, object]:
+    """Snapshots a hosted game's join status into a plain dict -- backs the
+    `host_status` MCP tool (see `build_server`). See the module docstring's
+    "Hosting a two-player match" section for the full state derivation this
+    implements and why no separate state machine is needed: every input
+    here (`bot_ai.host_state`, `bot_ai.ready`, `game_task.done()`) already
+    exists in this module for other reasons.
+
+    `bot_ai.host_state is None` means `bot_ai` was not started via
+    `host_game` at all (an ordinary solo game, or a hosted game that's
+    since been replaced by `new_game`/another `host_game` call) -- reported
+    as a clear `ok=False` error rather than a `status` value, since
+    "waiting"/"joined"/"failed" all presuppose a hosted game actually
+    exists to report on."""
+    if bot_ai.host_state is None:
+        return {
+            "ok": False,
+            "error": "No hosted game is active on the current game session. Call host_game first.",
+        }
+
+    state = bot_ai.host_state
+    if bot_ai.ready.is_set():
+        status = "joined"
+        error = None
+    elif game_task.done():
+        status = "failed"
+        if state.timed_out:
+            error = "No peer joined within the configured join_timeout."
+        elif game_task.cancelled():
+            error = "The hosted game was cancelled (e.g. by a new_game call) before a peer joined."
+        else:
+            error = f"{type(game_task.exception()).__name__}: {game_task.exception()}"
+    else:
+        status = "waiting"
+        error = None
+
+    return {"ok": True, "match_code": state.match_code, "status": status, "error": error}
 
 
 def build_server(active: _ActiveGame, defaults: _GameConfig, name: str = "sc2-sdk") -> FastMCP:
@@ -2016,27 +2309,7 @@ def build_server(active: _ActiveGame, defaults: _GameConfig, name: str = "sc2-sd
         `_tasks` starts empty.
         """
         async with active.lock:
-            old_bot_ai = active.bot_ai
-            old_game_task = active.game_task
-            previous_game_torn_down = False
-            if not old_game_task.done():
-                old_game_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await old_game_task
-                previous_game_torn_down = True
-
-            # Whether old_game_task above was just cancelled or had already
-            # finished on its own before this call, _host_game's `async with
-            # SC2Process(...)` block has now fully exited either way -- its
-            # SC2 client is gone (via KillSwitch/__aexit__ cleanup; see this
-            # module's "Single-instance guard..." section on SIGINT-based
-            # cleanup normally working fine, it's only SIGTERM to a *stale*
-            # sc2-sdk-mcp process later that can't rely on this). Drop it
-            # from this process's own bookkeeping so the lockfile stops
-            # advertising a PID that's already dead -- see
-            # _untrack_sc2_pid's docstring for why this is hygiene, not a
-            # correctness requirement.
-            _untrack_sc2_pid(old_bot_ai.sc2_pid, lockfile_path=_active_lockfile_path)
+            previous_game_torn_down = await _teardown_active_game(active)
 
             config = _GameConfig(
                 map_name=map_name if map_name is not None else defaults.map_name,
@@ -2072,6 +2345,110 @@ def build_server(active: _ActiveGame, defaults: _GameConfig, name: str = "sc2-sd
                 "snippet_timeout_seconds": config.snippet_timeout_seconds,
                 "previous_game_torn_down": previous_game_torn_down,
             }
+
+    @mcp.tool()
+    async def host_game(
+        map_name: str | None = None,
+        my_race: str | None = None,
+        opponent_race_pin: str | None = None,
+        host_ip: str = "127.0.0.1",
+        game_time_limit: int | None = None,
+        snippet_timeout_seconds: float | None = None,
+        join_timeout: float = DEFAULT_JOIN_TIMEOUT,
+    ) -> dict[str, object]:
+        """Host a real two-player match and return a shareable match code
+        IMMEDIATELY, without waiting for a peer to connect -- see the
+        module docstring's "Hosting a two-player match" section for the
+        full design. Call `host_status` to poll whether a peer has joined
+        yet; once it reports `"joined"`, this game is playable through the
+        existing `execute_code`/`start_task` tools exactly like any other
+        game this server serves.
+
+        Ends whatever game is currently active first, the same "cancel
+        outright, don't wait" teardown `new_game` already performs (see
+        `_teardown_active_game`) -- so calling `host_game` is itself how you
+        abandon a game you no longer want, same as calling `new_game` is.
+
+        `map_name`/`my_race` fall back to this server's original launch
+        configuration (`defaults`) if omitted, the same convention
+        `new_game` uses -- but unlike `new_game`, there is no
+        `opponent_race`/`difficulty` here: those describe the built-in AI
+        `new_game` plays against, which doesn't apply once a real peer is
+        joining. `opponent_race_pin`, if given, is embedded into the match
+        code for the *joining* side to see (their own explicit race choice
+        always wins over it) -- it does not affect this side's own race.
+
+        `host_ip` defaults to loopback (`"127.0.0.1"`) -- NOT the Tailscale
+        auto-detection the standalone `sc2-sdk-host` CLI defaults to -- see
+        the module docstring for why: this defaults to a same-machine
+        match, with no Tailscale involvement at all unless a real routable
+        address is passed here explicitly.
+
+        Realtime is not a parameter here: hosted games always run at
+        wall-clock speed (see the module docstring for why "paused between
+        calls" cannot work once a second, independently-paced client is
+        synchronized into the same match).
+
+        `join_timeout` (default: `sdk.host_join.DEFAULT_JOIN_TIMEOUT`, the
+        same default the standalone CLI uses) bounds only how long this
+        waits for a peer to connect, not the match itself once joined --
+        see `host_status` for how a caller learns whether that timeout was
+        hit.
+
+        Returns `{"match_code": ..., "host_ip": ..., "map_name": ...,
+        "my_race": ..., "opponent_race_pin": ..., "join_timeout": ...,
+        "previous_game_torn_down": ...}`."""
+        async with active.lock:
+            previous_game_torn_down = await _teardown_active_game(active)
+
+            resolved_map_name = map_name if map_name is not None else defaults.map_name
+            resolved_my_race = _RACE_BY_NAME[my_race] if my_race is not None else defaults.my_race
+            resolved_race_pin = _RACE_BY_NAME[opponent_race_pin] if opponent_race_pin is not None else None
+            resolved_snippet_timeout = (
+                snippet_timeout_seconds if snippet_timeout_seconds is not None else defaults.snippet_timeout_seconds
+            )
+
+            new_bot_ai, new_game_task, match_code = _launch_hosted_game(
+                map_name=resolved_map_name,
+                my_race=resolved_my_race,
+                opponent_race_pin=resolved_race_pin,
+                host_ip=host_ip,
+                game_time_limit=game_time_limit,
+                snippet_timeout_seconds=resolved_snippet_timeout,
+                join_timeout=join_timeout,
+            )
+            active.bot_ai = new_bot_ai
+            active.game_task = new_game_task
+
+            return {
+                "match_code": match_code,
+                "host_ip": host_ip,
+                "map_name": resolved_map_name,
+                "my_race": resolved_my_race.name,
+                "opponent_race_pin": resolved_race_pin.name if resolved_race_pin is not None else None,
+                "join_timeout": join_timeout,
+                "previous_game_torn_down": previous_game_torn_down,
+            }
+
+    @mcp.tool()
+    async def host_status() -> dict[str, object]:
+        """Reports a `host_game`-started match's current join status --
+        see the module docstring's "Hosting a two-player match" section for
+        the full design and `host_game`'s own docstring for how to start
+        one.
+
+        Returns `{"ok": True, "match_code": ..., "status":
+        "waiting"|"joined"|"failed", "error": <why, only when "failed",
+        else None>}`, or `{"ok": False, "error": ...}` if the current game
+        wasn't started via `host_game` at all (an ordinary solo game, or a
+        hosted game that's since been replaced by `new_game`/another
+        `host_game` call).
+
+        Does NOT wait for anything -- unlike `execute_code`/`new_game`,
+        this never awaits `bot_ai.ready`, since the entire point is to
+        check in on a wait that may still be ongoing without blocking on
+        it."""
+        return _host_status(active.bot_ai, active.game_task)
 
     return mcp
 
