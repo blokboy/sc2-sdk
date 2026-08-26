@@ -1481,6 +1481,12 @@ INSTANCE_ID` was passed, in which case it's scoped to that id instead
 instances (e.g. one hosting, one joining a two-LLM match on the same
 machine) coexist without either one's guard terminating the other.
 
+Reconfigures python-sc2's logging off of `sys.stdout` first, before
+even that guard -- see `_silence_python_sc2_stdout_logging` and this
+module's "Keeping python-sc2's own logging off of stdout" section
+(ticket #19): stdout is this process's MCP JSON-RPC transport, so no
+log line, from any source, may land there.
+
 ## `sdk.join`
 
 *Source: [`src/sdk/join.py`](../src/sdk/join.py)*
@@ -1754,17 +1760,48 @@ joiner didn't choose one, and to `Race.Random` if neither did.
 ### `wait_for_joiner`
 
 ```python
-async def wait_for_joiner(awaitable: Awaitable[_T], timeout: float) -> _T
+async def wait_for_joiner(awaitable: Awaitable[_T], timeout: float, *, on_timeout: Callable[[], Awaitable[None]] | None=None) -> _T
 ```
 
 Bound how long the host waits for a joiner (ticket #12's timeout
 acceptance criterion) around whatever awaitable actually represents
 "a joiner showed up" in production -- the host's own blocking
 `join_game` call (see `sdk.join`'s docstring: that call doesn't return
-until the peer's engine handshake resolves, so wrapping it in a plain
-`asyncio.wait_for` is sufficient; there's no separate "waiting" signal
-to hook into). Kept generic and given a stub awaitable in tests so this
-seam doesn't require a real SC2 client.
+until the peer's engine handshake resolves).
+
+Ticket #18: a plain `asyncio.wait_for(awaitable, timeout=timeout)` is
+NOT sufficient here, despite looking like the obvious fit. `wait_for`
+cancels the awaited coroutine by throwing `CancelledError` into it at
+its current suspension point, then waits for that cancellation to
+actually unwind before raising `TimeoutError`. python-sc2's own
+`Protocol.__request` (the method underneath `join_game`) deliberately
+catches that first `CancelledError` and immediately does a second,
+un-cancellable raw `await self._ws.receive_bytes()` before
+re-raising -- see its comment, "If request is sent, the response must
+be received before reraising cancel". That second receive only ever
+completes once the local SC2 client actually sends a response, which
+it does not do until a peer joins. With nobody ever joining, that
+second receive blocks forever, the cancellation this function asked
+for never actually completes, and `wait_for` never gets to raise
+-- confirmed by observing a real local host hang indefinitely (well
+past the configured timeout) with the awaited task stuck in
+`Task.cancelling()` state, still suspended inside that second receive.
+
+So this function drives the awaitable as its own `Task` and, on
+timeout, does not wait for that task to unwind on its own: it cancels
+the task (best-effort, matching normal `asyncio` conventions) and
+calls `on_timeout` (if given) to let the caller force the underlying
+call to actually return -- in practice, closing the SC2 client's
+websocket, which makes that stuck second `receive_bytes()` resolve
+(with an error) instead of hanging forever. Either way, this function
+itself raises `JoinTimeoutError` as soon as the timeout elapses,
+without waiting on the task any further; any exception the abandoned
+task eventually raises is retrieved and discarded (not reported --
+`JoinTimeoutError` is already the caller-facing signal) so it isn't
+logged as "never retrieved".
+
+Kept generic (no SC2-specific types) and given a stub awaitable/
+`on_timeout` in tests so this seam doesn't require a real SC2 client.
 
 ## `sdk.host_join`
 
