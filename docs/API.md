@@ -110,6 +110,42 @@ hardcoded here. Ticket #3 only *exercises* this against Terran integration
 tests -- #4 (Protoss) and #5 (Zerg) are expected to reuse this class
 directly rather than re-deriving the verification pattern.
 
+### `refresh_realtime_state`
+
+```python
+async def refresh_realtime_state(ai: BotAI, frames: int=0) -> None
+```
+
+Flush queued actions and refresh `ai`'s state (`ai.state`/`ai.units`/
+etc.) to the server's own free-running game loop, `frames` loops ahead
+of whatever `ai.state.game_loop` currently is -- the realtime-mode
+equivalent of manually stepping the simulation (which, unlike
+non-realtime mode, isn't legal here; see `Bot._advance_realtime`'s
+docstring below, which this function was factored out of).
+
+`frames=0` (the default) means "refresh to whatever the server's
+current loop already is" rather than "wait for N more loops to
+elapse": since realtime mode's engine free-runs on its own wall-clock
+timer independently of Python, `ai.state.game_loop` going into this
+call is already whatever loop was last observed -- typically some real
+time in the past by the time this coroutine actually runs -- so the
+server's own current loop is normally already at or past
+`target_loop`, and `client.observation(target_loop)` returns as soon as
+its round trip completes, with no additional waiting. (Only if this is
+called back-to-back with essentially no elapsed wall-clock time could
+the server's loop not yet have reached `target_loop`, in which case
+this waits for one more tick -- still on the order of the server's own
+tick rate, not an open-ended block.)
+
+Shared by `Bot._advance_realtime` (verification polling, which passes
+a positive `frames` to wait for actual progress) and
+`ExecuteCodeBotAI.on_step` (`sdk/mcp_server.py`, ticket #21: refreshing
+state once per dequeued request, with `frames=0`, to close the "state
+is stale by however long the caller took composing its next call" gap)
+-- both need the identical flush-observe-rebuild-reprepare sequence,
+just for different reasons and different target loops, so it lives
+here once rather than being reimplemented at the second call site.
+
 ### class `Bot`
 
 Wraps a live `BotAI` instance with the verified `bot.*` API.
@@ -1270,6 +1306,14 @@ DEFAULT_SNIPPET_TIMEOUT_SECONDS = 45.0
 ```
 
 Default per-`execute_code`-call timeout (in seconds), used by `on_step`'s `asyncio.wait_for` around `_eval_snippet` -- see the module docstring's "Per-call timeout and single automatic retry" section for the full mechanism this guards. 45 seconds: generous enough (tens of seconds, not single-digit seconds) that an ordinary realtime resource-wait loop -- e.g. `while not sdk.can_afford(X): await bot._advance(22)` waiting for minerals to accumulate under normal income -- comfortably finishes well within it, while still bounding a genuinely wedged snippet (like the real incident this feature was built for: a supply-cap bug that turned an `await bot._advance(22)` loop into an infinite one) to under a minute times two attempts, instead of hanging `on_step` -- and therefore the whole game -- forever. A snippet known in advance to legitimately need longer than this (e.g. a genuinely slow-income minerals wait that can take upwards of a minute) should pass its own `timeout_seconds` to `execute_code` rather than raising this server-wide default, which would make every *other* call wait just as long before a real bug is ever detected. See `_GameConfig.snippet_timeout_seconds` for how this default is overridden per-server (`--snippet-timeout`) and persists across `new_game` calls.
+
+### `REALTIME_STATE_REFRESH_TIMEOUT_SECONDS`
+
+```python
+REALTIME_STATE_REFRESH_TIMEOUT_SECONDS = 2.0
+```
+
+Bounded timeout (in seconds) for the realtime state-refresh RPC `on_step` performs right after dequeuing a request, before handing it to `_eval_snippet` -- ticket #21 (realtime think-time staleness gap): in realtime mode the SC2 server free-runs on its own wall-clock timer while `on_step` is blocked on `self._queue.get()`, so the state a snippet would otherwise see is stale by however long the caller took composing that call. See `on_step` for the full mechanism (`sdk.bot.refresh_realtime_state`, the same flush-observe-rebuild sequence `Bot._advance_realtime` already used for verification polling, called with `frames=0` for "catch up to whatever the server's current loop already is").  This is a *separate* timeout from `request.timeout_seconds` -- it guards SDK plumbing overhead, not the snippet's own execution budget, and must not eat into it. Per this module's "nothing inside on_step may block unboundedly" rule (see the module docstring's "Per-call timeout and single automatic retry" section -- the same rule that motivated that mechanism in the first place), this refresh needs its own bound rather than being left as a new unbounded await. 2 seconds: this is a single local RPC round trip to an already-running SC2 process on the same machine (no network hop), which normally completes in well under 100ms -- 2s leaves generous headroom for a transient scheduling hiccup while still being short enough that a genuinely wedged client is caught quickly (the refresh degrades gracefully on timeout -- see `on_step` -- rather than failing the caller's call, so there is no benefit to a larger value beyond "clearly implausible for a healthy local RPC").
 
 ### `DEFAULT_TASK_MAX_ITERATIONS`
 
