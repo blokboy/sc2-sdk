@@ -73,7 +73,8 @@ from sdk.outcomes import BuildOutcome, ChatOutcome, MoveOutcome, ResearchOutcome
 #: Number of raw simulation frames each verification poll advances by (see
 #: Bot._advance). 4 matches python-sc2's own default per-iteration cadence
 #: (Client.game_step), i.e. one poll below is worth roughly one normal bot
-#: "tick" of game time (~0.18s).
+#: "tick" of game time (~0.18s). Non-realtime only -- see _REALTIME_POLL_FRAMES
+#: for realtime mode's tighter equivalent.
 _POLL_FRAMES = 4
 
 #: Default number of verification polls (each _POLL_FRAMES long) a verified
@@ -83,8 +84,110 @@ _POLL_FRAMES = 4
 #: every action call expensive. Callers doing something that legitimately
 #: takes longer (e.g. a structure whose builder has to walk further, or a
 #: build with no fast-build cheat active) can pass a larger max_wait_steps
-#: explicitly -- see e.g. build()'s own, larger default below.
+#: explicitly -- see e.g. build()'s own, larger default below. Non-realtime
+#: only -- see _REALTIME_DEFAULT_MAX_WAIT_STEPS for realtime mode.
 _DEFAULT_MAX_WAIT_STEPS = 5
+
+#: move()/attack_move()'s own (non-realtime) default, promoted to a named
+#: constant so it sits next to its realtime counterpart below -- the two
+#: literal `3`s the module docstring/ticket #20 refer to as "move/attack_move
+#: override to 3" (unchanged from before this ticket).
+_MOVE_DEFAULT_MAX_WAIT_STEPS = 3
+
+#: build()'s own (non-realtime) default -- unchanged from before this
+#: ticket, just moved from a class attribute to a module-level constant
+#: (alongside its realtime counterpart below) so `_resolve_max_wait_steps`
+#: can reference it as a plain name from inside a method body, where a
+#: same-named class attribute wouldn't be in scope. Building requires the
+#: assigned worker to walk to the placement point before construction can
+#: start, unlike train/research which dispatch from a structure that's
+#: already in place -- so build()'s default verification window is longer
+#: (see also: confirmation requires the structure entity to actually
+#: appear, not just already_pending() ticking up while the worker is still
+#: walking there -- see build()'s own confirmation loop).
+_BUILD_DEFAULT_MAX_WAIT_STEPS = 40
+
+# -- realtime-only overrides (ticket #20) -------------------------------------
+#
+# In realtime mode the SC2 engine free-runs on its own wall-clock timer (see
+# Bot._advance_realtime's docstring), so every poll above is real, additive
+# wall-clock latency sitting on top of an LLM caller's own turn -- unlike
+# non-realtime/stepped mode, where polling more frames costs nothing in wall
+# time. These constants are used ONLY on Bot._advance's `self._ai.realtime`
+# branch (see there) and by each verified action's own realtime branch below;
+# non-realtime behavior and the constants above are completely unchanged.
+#
+# Derived from real measurement (not guessed -- see
+# scripts/benchmark_realtime_verification.py, kept committed so these numbers
+# can be re-derived later), against a real local realtime match, built-in
+# Easy AI opponent, three separate runs across three different maps
+# (AutomatonLE/KairosJunctionLE/CyberForestLE). Combined per-action-type
+# wall-clock latency from command dispatch to effect_confirmed=True (26
+# samples each for train/move/attack_move/build, 12 for research, all with
+# an artificially huge max_wait_steps so no sample was truncated by the
+# ceiling being measured):
+#
+#   action        min     p50     p95     max    (seconds)
+#   train        0.139   0.183   0.243   0.528
+#   move         0.147   0.191   0.238   0.249
+#   attack_move  0.150   0.178   0.248   0.254
+#   build        0.939   2.767   7.500   7.537
+#   research     0.156   0.183   0.266   0.267
+#
+# train/move/attack_move/research all confirm within a couple hundred ms in
+# the overwhelming majority of samples (typically the very first poll or
+# two); build is the outlier by design (see _BUILD_DEFAULT_MAX_WAIT_STEPS's
+# own docstring) -- a worker genuinely has to walk to the site, and that walk
+# alone measured as high as 7.5s here, essentially matching non-realtime's
+# existing 7.2s worst-case budget (_BUILD_DEFAULT_MAX_WAIT_STEPS=40 *
+# _POLL_FRAMES=4 / 22.4 loops-per-second).
+
+#: Realtime polling granularity: finer than _POLL_FRAMES's 4 (~0.18s/poll) at
+#: 2 frames (~0.09s/poll, 22.4 game loops/sec at normal speed -- see
+#: sc2.main's own game_time_limit conversion). Finer polling means less
+#: quantization error on top of an action's true confirmation latency --
+#: capped below at a "poll cost floor" (2 frames), not 1, so this doesn't
+#: chase diminishing returns against per-poll IPC/observation-request
+#: overhead that finer-still polling wouldn't meaningfully reduce.
+_REALTIME_POLL_FRAMES = 2
+
+#: Realtime train/research/move-attack-default ceiling: 9 polls * 2 frames /
+#: 22.4 loops-per-sec ~= 0.80s worst-case wait -- below the
+#: non-realtime-shared ~0.89s equivalent (5 * 4 / 22.4), while staying
+#: comfortably above the measured distribution for both action types
+#: (train: p95=0.243s, max=0.528s across the main benchmark run, with a
+#: repeat max of 0.534s seen in a separate spot-check against the tuned
+#: defaults themselves -- see scripts/benchmark_realtime_verification.py's
+#: module docstring; research: p95=0.266s, max=0.267s) -- a ~1.5x margin
+#: over the rarer train max, and a much wider margin over the typical (p95)
+#: case for both.
+_REALTIME_DEFAULT_MAX_WAIT_STEPS = 9
+
+#: Realtime move/attack_move ceiling: these confirm even faster and more
+#: consistently than train/research (measured p95=0.238s/0.248s,
+#: max=0.249s/0.254s -- no server-side production/research bookkeeping to
+#: wait on, just an order being picked up) -- 5 polls * 2 frames / 22.4 ~=
+#: 0.45s worst-case wait, well below the non-realtime-shared 3-step/~0.54s
+#: equivalent, with a ~1.75x margin over the measured max.
+_REALTIME_MOVE_MAX_WAIT_STEPS = 5
+
+#: Realtime build ceiling: DELIBERATELY NOT shrunk the way the ceilings
+#: above are -- see this ticket's explicit warning against letting build()
+#: regress into effect_confirmed=False being the common case. Measured
+#: worker-walk-time maxed out at 7.537s wall-clock (~169 simulation loops at
+#: 22.4 loops/sec) across 26 samples spanning three maps -- notably, that
+#: already exceeds non-realtime's own nominal budget (_BUILD_DEFAULT_MAX_WAIT_STEPS=40
+#: * _POLL_FRAMES=4 = 160 loops), meaning the pre-existing non-realtime
+#: ceiling was already only marginally sufficient for a real worst-case walk,
+#: with no margin at all. 170 polls * 2 frames / 22.4 ~= 15.2s worst-case
+#: wait -- roughly double the measured max/p95 (both ~7.5s), and comfortably
+#: above the ~169-loop worst case observed, which is the generous-margin
+#: behavior this ticket explicitly asks for on build specifically. Finer
+#: 2-frame polling here mainly buys faster typical-case detection once a
+#: worker actually arrives, not a smaller ceiling -- the ceiling itself has
+#: to stay sized to real, physical worker-travel time, which realtime
+#: polling cadence cannot shrink.
+_REALTIME_BUILD_MAX_WAIT_STEPS = 170
 
 
 async def refresh_realtime_state(ai: BotAI, frames: int = 0) -> None:
@@ -167,10 +270,20 @@ class Bot:
                 "inspect the final state instead."
             )
 
-    async def _advance(self, frames: int = _POLL_FRAMES) -> None:
+    async def _advance(self, frames: int | None = None) -> None:
         """Flush queued actions, advance the simulation by `frames` raw
         simulation frames, and refresh self._ai's state -- see the module
         docstring for why this is necessary for verification.
+
+        `frames=None` (the default every call site above uses) resolves to
+        `_POLL_FRAMES` (non-realtime) or `_REALTIME_POLL_FRAMES` (realtime) --
+        see the "realtime-only overrides" section up top for why realtime
+        gets its own, finer default here: this is the one place that
+        distinction is applied, so every verified action automatically picks
+        up the right granularity for the mode it's actually running in,
+        without any of them branching on `self._ai.realtime` themselves.
+        Passing `frames` explicitly (no current caller does) overrides this
+        resolution entirely, same as before this ticket.
 
         Branches on `self._ai.realtime` (set by python-sc2's own
         `_prepare_start`): non-realtime games use `BotAI._advance_steps`
@@ -188,9 +301,9 @@ class Bot:
         `_advance_steps`'s own upstream docstring warns about, and
         empirically stalled for tens of real seconds per call."""
         if self._ai.realtime:
-            await self._advance_realtime(frames)
+            await self._advance_realtime(frames if frames is not None else _REALTIME_POLL_FRAMES)
         else:
-            await self._ai._advance_steps(frames)  # noqa: SLF001 -- see module docstring
+            await self._ai._advance_steps(frames if frames is not None else _POLL_FRAMES)  # noqa: SLF001 -- see module docstring
 
     async def _advance_realtime(self, frames: int) -> None:
         """Realtime-mode equivalent of `BotAI._advance_steps` that waits
@@ -231,6 +344,28 @@ class Bot:
                 found.append(unit)
         return found, missing
 
+    def _resolve_max_wait_steps(
+        self, max_wait_steps: int | None, realtime_default: int, non_realtime_default: int
+    ) -> int:
+        """Resolve a caller-supplied `max_wait_steps` (`None` meaning "use
+        whichever default fits the mode this game is actually running in")
+        to a concrete step count -- the max_wait_steps half of ticket #20's
+        realtime-only override, mirroring what `_advance`'s own `frames`
+        resolution already does for polling granularity.
+
+        This can't be expressed as an ordinary parameter default (e.g.
+        `max_wait_steps: int = _DEFAULT_MAX_WAIT_STEPS`) because a parameter
+        default is evaluated once, at class-definition time -- there's no
+        `self` available then to check `self._ai.realtime` against. Each
+        verified action below instead defaults its own `max_wait_steps` to
+        `None` and calls this at the top of its body, where `self._ai` is
+        live. Non-realtime callers get exactly the pre-#20 constants either
+        way -- only the realtime branch's values are new.
+        """
+        if max_wait_steps is not None:
+            return max_wait_steps
+        return realtime_default if self._ai.realtime else non_realtime_default
+
     # -- train ---------------------------------------------------------------
 
     async def train(
@@ -239,7 +374,7 @@ class Bot:
         amount: int = 1,
         closest_to: Point2 | None = None,
         train_only_idle_buildings: bool = True,
-        max_wait_steps: int = _DEFAULT_MAX_WAIT_STEPS,
+        max_wait_steps: int | None = None,
     ) -> TrainOutcome:
         """Train `amount` of `unit_type` from any eligible, idle, completed
         production structure, and confirm production actually started.
@@ -255,9 +390,19 @@ class Bot:
         wait window, that the unit(s) themselves now exist) -- not merely
         that `python-sc2`'s local, optimistic bookkeeping thought the
         command would succeed.
+
+        `max_wait_steps` defaults to `None`, which resolves to
+        `_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+        `_REALTIME_DEFAULT_MAX_WAIT_STEPS` (realtime) -- see
+        `_resolve_max_wait_steps` and the "realtime-only overrides" section
+        near the top of this module. Pass an explicit value to override
+        either default.
         """
         ai = self._ai
         self._require_live()
+        max_wait_steps = self._resolve_max_wait_steps(
+            max_wait_steps, _REALTIME_DEFAULT_MAX_WAIT_STEPS, _DEFAULT_MAX_WAIT_STEPS
+        )
 
         if ai.tech_requirement_progress(unit_type) < 1:
             return TrainOutcome(
@@ -349,22 +494,13 @@ class Bot:
 
     # -- build -----------------------------------------------------------------
 
-    #: Building requires the assigned worker to walk to the placement
-    #: point before construction can start, unlike train/research which
-    #: dispatch from a structure that's already in place -- so build()'s
-    #: default verification window is longer (see also: confirmation
-    #: requires the structure entity to actually appear, not just
-    #: already_pending() ticking up while the worker is still walking
-    #: there -- see the loop below).
-    _BUILD_DEFAULT_MAX_WAIT_STEPS = 40
-
     async def build(
         self,
         structure_type: UnitTypeId,
         near: Unit | Point2,
         max_distance: int = 20,
         build_worker: Unit | None = None,
-        max_wait_steps: int = _BUILD_DEFAULT_MAX_WAIT_STEPS,
+        max_wait_steps: int | None = None,
     ) -> BuildOutcome:
         """Build `structure_type` near `near`, and confirm construction
         actually started -- meaning a new structure entity of that type is
@@ -386,9 +522,24 @@ class Bot:
         an entirely different reason (never having been dispatched at all)
         than what `effect_confirmed=False` normally means (dispatched, but
         not yet observably true).
+
+        `max_wait_steps` defaults to `None`, which resolves to
+        `_BUILD_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+        `_REALTIME_BUILD_MAX_WAIT_STEPS` (realtime) -- see
+        `_resolve_max_wait_steps` and the "realtime-only overrides" section
+        near the top of this module. Both budgets stay generous: a worker
+        genuinely has to walk to the site, which measured up to ~7.5s of
+        real wall-clock time even in realtime mode (see
+        `scripts/benchmark_realtime_verification.py`) -- shrinking this the
+        way train/research/move's ceilings were shrunk would make
+        `effect_confirmed=False` the common case for the most build-heavy
+        parts of play, which this ticket explicitly rules out.
         """
         ai = self._ai
         self._require_live()
+        max_wait_steps = self._resolve_max_wait_steps(
+            max_wait_steps, _REALTIME_BUILD_MAX_WAIT_STEPS, _BUILD_DEFAULT_MAX_WAIT_STEPS
+        )
 
         near_point = near.position if isinstance(near, Unit) else near
         position_report = (near_point.x, near_point.y) if isinstance(near_point, Point2) else None
@@ -479,12 +630,22 @@ class Bot:
     async def research(
         self,
         upgrade_type: UpgradeId,
-        max_wait_steps: int = _DEFAULT_MAX_WAIT_STEPS,
+        max_wait_steps: int | None = None,
     ) -> ResearchOutcome:
         """Research `upgrade_type` from any idle, completed structure that
-        can research it, and confirm research actually started."""
+        can research it, and confirm research actually started.
+
+        `max_wait_steps` defaults to `None`, which resolves to
+        `_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+        `_REALTIME_DEFAULT_MAX_WAIT_STEPS` (realtime) -- see
+        `_resolve_max_wait_steps` and the "realtime-only overrides" section
+        near the top of this module.
+        """
         ai = self._ai
         self._require_live()
+        max_wait_steps = self._resolve_max_wait_steps(
+            max_wait_steps, _REALTIME_DEFAULT_MAX_WAIT_STEPS, _DEFAULT_MAX_WAIT_STEPS
+        )
 
         if upgrade_type in ai.state.upgrades:
             return ResearchOutcome(
@@ -559,10 +720,17 @@ class Bot:
         units: Unit | Units | int | list,
         target: Point2 | Unit,
         queue: bool = False,
-        max_wait_steps: int = 3,
+        max_wait_steps: int | None = None,
     ) -> MoveOutcome:
         """Move a unit or unit group to `target`, and confirm each unit
-        actually picked up a move order."""
+        actually picked up a move order.
+
+        `max_wait_steps` defaults to `None`, which resolves to
+        `_MOVE_DEFAULT_MAX_WAIT_STEPS` (non-realtime, 3) or
+        `_REALTIME_MOVE_MAX_WAIT_STEPS` (realtime) -- see
+        `_resolve_max_wait_steps` and the "realtime-only overrides" section
+        near the top of this module.
+        """
         return await self._move_or_attack("move", units, target, queue, max_wait_steps)
 
     async def attack_move(
@@ -570,10 +738,11 @@ class Bot:
         units: Unit | Units | int | list,
         target: Point2 | Unit,
         queue: bool = False,
-        max_wait_steps: int = 3,
+        max_wait_steps: int | None = None,
     ) -> MoveOutcome:
         """Attack-move a unit or unit group toward `target`, and confirm
-        each unit actually picked up an attack order."""
+        each unit actually picked up an attack order. See `move`'s docstring
+        for `max_wait_steps`'s default-resolution behavior."""
         return await self._move_or_attack("attack_move", units, target, queue, max_wait_steps)
 
     async def _move_or_attack(
@@ -582,10 +751,13 @@ class Bot:
         units: Unit | Units | int | list,
         target: Point2 | Unit,
         queue: bool,
-        max_wait_steps: int,
+        max_wait_steps: int | None,
     ) -> MoveOutcome:
         ai = self._ai
         self._require_live()
+        max_wait_steps = self._resolve_max_wait_steps(
+            max_wait_steps, _REALTIME_MOVE_MAX_WAIT_STEPS, _MOVE_DEFAULT_MAX_WAIT_STEPS
+        )
 
         found, missing = self._resolve_units(units)
         requested_tags = tuple(u.tag for u in found) + tuple(missing)

@@ -151,7 +151,7 @@ plus the now-final `match_result`).
 #### `Bot.train`
 
 ```python
-async def train(self, unit_type: UnitTypeId, amount: int=1, closest_to: Point2 | None=None, train_only_idle_buildings: bool=True, max_wait_steps: int=_DEFAULT_MAX_WAIT_STEPS) -> TrainOutcome
+async def train(self, unit_type: UnitTypeId, amount: int=1, closest_to: Point2 | None=None, train_only_idle_buildings: bool=True, max_wait_steps: int | None=None) -> TrainOutcome
 ```
 
 Train `amount` of `unit_type` from any eligible, idle, completed
@@ -169,10 +169,17 @@ wait window, that the unit(s) themselves now exist) -- not merely
 that `python-sc2`'s local, optimistic bookkeeping thought the
 command would succeed.
 
+`max_wait_steps` defaults to `None`, which resolves to
+`_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+`_REALTIME_DEFAULT_MAX_WAIT_STEPS` (realtime) -- see
+`_resolve_max_wait_steps` and the "realtime-only overrides" section
+near the top of this module. Pass an explicit value to override
+either default.
+
 #### `Bot.build`
 
 ```python
-async def build(self, structure_type: UnitTypeId, near: Unit | Point2, max_distance: int=20, build_worker: Unit | None=None, max_wait_steps: int=_BUILD_DEFAULT_MAX_WAIT_STEPS) -> BuildOutcome
+async def build(self, structure_type: UnitTypeId, near: Unit | Point2, max_distance: int=20, build_worker: Unit | None=None, max_wait_steps: int | None=None) -> BuildOutcome
 ```
 
 Build `structure_type` near `near`, and confirm construction
@@ -196,32 +203,57 @@ an entirely different reason (never having been dispatched at all)
 than what `effect_confirmed=False` normally means (dispatched, but
 not yet observably true).
 
+`max_wait_steps` defaults to `None`, which resolves to
+`_BUILD_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+`_REALTIME_BUILD_MAX_WAIT_STEPS` (realtime) -- see
+`_resolve_max_wait_steps` and the "realtime-only overrides" section
+near the top of this module. Both budgets stay generous: a worker
+genuinely has to walk to the site, which measured up to ~7.5s of
+real wall-clock time even in realtime mode (see
+`scripts/benchmark_realtime_verification.py`) -- shrinking this the
+way train/research/move's ceilings were shrunk would make
+`effect_confirmed=False` the common case for the most build-heavy
+parts of play, which this ticket explicitly rules out.
+
 #### `Bot.research`
 
 ```python
-async def research(self, upgrade_type: UpgradeId, max_wait_steps: int=_DEFAULT_MAX_WAIT_STEPS) -> ResearchOutcome
+async def research(self, upgrade_type: UpgradeId, max_wait_steps: int | None=None) -> ResearchOutcome
 ```
 
 Research `upgrade_type` from any idle, completed structure that
 can research it, and confirm research actually started.
 
+`max_wait_steps` defaults to `None`, which resolves to
+`_DEFAULT_MAX_WAIT_STEPS` (non-realtime) or
+`_REALTIME_DEFAULT_MAX_WAIT_STEPS` (realtime) -- see
+`_resolve_max_wait_steps` and the "realtime-only overrides" section
+near the top of this module.
+
 #### `Bot.move`
 
 ```python
-async def move(self, units: Unit | Units | int | list, target: Point2 | Unit, queue: bool=False, max_wait_steps: int=3) -> MoveOutcome
+async def move(self, units: Unit | Units | int | list, target: Point2 | Unit, queue: bool=False, max_wait_steps: int | None=None) -> MoveOutcome
 ```
 
 Move a unit or unit group to `target`, and confirm each unit
 actually picked up a move order.
 
+`max_wait_steps` defaults to `None`, which resolves to
+`_MOVE_DEFAULT_MAX_WAIT_STEPS` (non-realtime, 3) or
+`_REALTIME_MOVE_MAX_WAIT_STEPS` (realtime) -- see
+`_resolve_max_wait_steps` and the "realtime-only overrides" section
+near the top of this module.
+
 #### `Bot.attack_move`
 
 ```python
-async def attack_move(self, units: Unit | Units | int | list, target: Point2 | Unit, queue: bool=False, max_wait_steps: int=3) -> MoveOutcome
+async def attack_move(self, units: Unit | Units | int | list, target: Point2 | Unit, queue: bool=False, max_wait_steps: int | None=None) -> MoveOutcome
 ```
 
 Attack-move a unit or unit group toward `target`, and confirm
-each unit actually picked up an attack order.
+each unit actually picked up an attack order. See `move`'s docstring
+for `max_wait_steps`'s default-resolution behavior.
 
 #### `Bot.chat`
 
