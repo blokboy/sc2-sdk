@@ -251,6 +251,15 @@ async def _run_host_role(
     peer's engine handshake), not the match itself once both sides have
     connected. `None` (default) preserves ticket #11's original untimed
     behavior.
+
+    Ticket #18: a bare `wait_for_joiner(_connect(), timeout=join_timeout)`
+    is not enough to actually make that timeout fire against a real SC2
+    client -- see `wait_for_joiner`'s docstring for why python-sc2's own
+    `join_game` call can swallow the cancellation `wait_for_joiner` sends
+    it and block forever anyway. `_abort_pending_connect` below is the
+    `on_timeout` hook that makes the timeout effective: closing this
+    role's own websocket connection is what actually unblocks the local
+    SC2 client's stuck response wait.
     """
     async with SC2Process() as server:
         await server.ping()
@@ -268,8 +277,22 @@ async def _run_host_role(
                 raise RuntimeError(f"Could not create game: {create_response.create_game}")
             return await _join_game_at(client, my_race, portconfig, host_ip, name=name)
 
+        async def _abort_pending_connect() -> None:
+            # See this function's docstring and wait_for_joiner's own --
+            # closing the connection is what forces the local SC2 client's
+            # own stuck join_game response wait to actually resolve.
+            # `server` (from SC2Process.__aenter__) is a Controller, not
+            # the SC2Process itself, but it wraps the same raw `_ws` this
+            # role's `client` was built from above -- closing it
+            # directly is enough; `SC2Process.__aexit__`'s own
+            # `_close_connection()` still runs the fuller teardown
+            # (closing the aiohttp session too, and killing the SC2
+            # process) once this JoinTimeoutError propagates out of the
+            # `async with SC2Process()` block.
+            await client._ws.close()
+
         if join_timeout is not None:
-            player_id = await wait_for_joiner(_connect(), timeout=join_timeout)
+            player_id = await wait_for_joiner(_connect(), timeout=join_timeout, on_timeout=_abort_pending_connect)
         else:
             player_id = await _connect()
 
@@ -296,7 +319,9 @@ async def _run_join_role(
     independent `SC2Process` from the host's) joins the match the host
     already created, pointed at `host_ip` -- mirrors `sc2.main._join_game`,
     generalized the same way as `_run_host_role` above. `join_timeout` has
-    the same meaning as `_run_host_role`'s."""
+    the same meaning as `_run_host_role`'s, including ticket #18's
+    `on_timeout`-forced-close fix (see `_run_host_role`'s docstring and
+    `wait_for_joiner`'s)."""
     async with SC2Process() as server:
         await server.ping()
         client = Client(server._ws)
@@ -304,8 +329,15 @@ async def _run_join_role(
         async def _connect() -> int:
             return await _join_game_at(client, my_race, portconfig, host_ip, name=name)
 
+        async def _abort_pending_connect() -> None:
+            # See _run_host_role's identical helper for why this is
+            # `client._ws.close()`, not `server._close_connection()` --
+            # `server` here is a Controller (from SC2Process.__aenter__),
+            # not the SC2Process itself, and has no such method.
+            await client._ws.close()
+
         if join_timeout is not None:
-            player_id = await wait_for_joiner(_connect(), timeout=join_timeout)
+            player_id = await wait_for_joiner(_connect(), timeout=join_timeout, on_timeout=_abort_pending_connect)
         else:
             player_id = await _connect()
 

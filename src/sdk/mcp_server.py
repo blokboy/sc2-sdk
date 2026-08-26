@@ -435,6 +435,7 @@ import io
 import json
 import os
 import secrets
+import sys
 import tempfile
 import traceback
 from collections import deque
@@ -2749,6 +2750,33 @@ async def serve_execute_code(
     return session
 
 
+# ---------------------------------------------------------------------------
+# Keeping python-sc2's own logging off of stdout (ticket #19)
+# ---------------------------------------------------------------------------
+# `sc2.main` (imported above, transitively, via `from sc2.main import
+# _host_game`) does `logger.remove(); logger.add(sys.stdout, level="INFO")`
+# at its own import time. loguru's `logger` is a single global sink
+# registry, not scoped per-importer -- so that sink is live for the whole
+# process the moment this module is imported, this module's own `logger.*`
+# calls included, not just python-sc2's. `sc2-sdk-mcp` talks MCP JSON-RPC
+# over stdout (see `main`'s docstring below), so any INFO-level line from
+# either source would land on the exact same stream a real client parses as
+# JSON-RPC. Verified against real two-process `mcp.client.stdio` sessions
+# while confirming #17 (the in-process test harness `serve_execute_code`/
+# the wiring test use doesn't share a real stdio pipe, so it can't surface
+# this -- see `serve_execute_code`'s docstring above).
+def _silence_python_sc2_stdout_logging() -> None:
+    """Reconfigure the shared loguru `logger` to stop writing to
+    `sys.stdout` -- swaps python-sc2's own `sys.stdout` sink for one on
+    `sys.stderr` at the same level, so nothing is lost, just moved off the
+    MCP transport stream. Called first thing in `main()`, before anything
+    else (including `_run_single_instance_guard`, which itself logs) gets a
+    chance to emit a line -- so no INFO+ log line can ever reach stdout for
+    the lifetime of this process."""
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Same flag names/conventions as sdk.play._parse_args -- deliberately
     not shared code (that module is off-limits per this ticket's brief),
@@ -2848,7 +2876,14 @@ def main(argv: list[str] | None = None) -> None:
     INSTANCE_ID` was passed, in which case it's scoped to that id instead
     (see `_lockfile_path_for`) -- letting two `--multiplayer`-launched
     instances (e.g. one hosting, one joining a two-LLM match on the same
-    machine) coexist without either one's guard terminating the other."""
+    machine) coexist without either one's guard terminating the other.
+
+    Reconfigures python-sc2's logging off of `sys.stdout` first, before
+    even that guard -- see `_silence_python_sc2_stdout_logging` and this
+    module's "Keeping python-sc2's own logging off of stdout" section
+    (ticket #19): stdout is this process's MCP JSON-RPC transport, so no
+    log line, from any source, may land there."""
+    _silence_python_sc2_stdout_logging()
     args = _parse_args(argv)
     _run_single_instance_guard(_lockfile_path_for(args.multiplayer))
     asyncio.run(_main_async(args))
