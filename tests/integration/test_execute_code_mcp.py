@@ -968,3 +968,80 @@ async def _run_task_new_game_lifecycle() -> None:
 
     result = await asyncio.wait_for(session.game_task, timeout=30)
     assert result == Result.Defeat
+
+
+@pytest.mark.integration
+def test_realtime_refresh_reflects_wait_time_between_calls(sc2_install):
+    """Ticket #21: in `realtime=True` mode, `ExecuteCodeBotAI.on_step`
+    (`sdk/mcp_server.py`) refreshes `ai.state`/`ai.units` to the server's
+    current game loop right after dequeuing a request, before handing it to
+    `_eval_snippet` -- closing the gap where the state a snippet sees would
+    otherwise be whatever was current *before* `on_step` started waiting on
+    `self._queue.get()`, stale by however long the caller took composing
+    that call (see the ticket's analysis of `sc2.main._play_game_ai`'s
+    realtime branch: it only requests an observation one `client.game_step`
+    ahead of the last known loop *before* calling `on_step`, not "catch up
+    to now").
+
+    This is the mirror image of `test_execute_code_against_real_game`'s own
+    "confirm the game is paused/stepped, not free-running" check above,
+    which deliberately asserts the OPPOSITE in non-realtime mode (a 3s
+    real-world gap between calls must NOT move `game_time` by more than a
+    single step, since nothing advances the engine while `on_step` is
+    blocked there). Here, with `realtime=True`, the SC2 engine free-runs on
+    its own wall-clock timer regardless of what `on_step` is doing -- the
+    thing under test is specifically whether the state `bot.observe()`
+    reports right after a deliberate wait actually reflects that wait
+    (proving the refresh ran and picked up fresh state), rather than
+    reporting a `game_time` that lags behind the real elapsed wait (which
+    is exactly the pre-fix symptom the ticket describes: an LLM reasoning
+    about outdated state on the very first decision of its turn).
+
+    `realtime=True` ties `game_time` (`game_loop / 22.4`) to true wall-clock
+    seconds at "Normal" game speed -- SC2's realtime mode does not run at
+    the accelerated "Faster" speed non-realtime/stepped matches use (see
+    `test_execute_code_against_real_game`'s comment on that) -- so a
+    generous lower-bound tolerance (half the real wait) comfortably absorbs
+    RPC/scheduling overhead while still clearly distinguishing "reflects the
+    wait" from "stuck at whatever loop was current when on_step started
+    waiting".
+    """
+    asyncio.run(_run_realtime_refresh_reflects_wait_time())
+
+
+async def _run_realtime_refresh_reflects_wait_time() -> None:
+    session = await serve_execute_code(
+        map_name=DEFAULT_MAP,
+        my_race=Race.Terran,
+        opponent_race=Race.Zerg,
+        difficulty=Difficulty.Easy,
+        game_time_limit=_SAFETY_TIME_LIMIT,
+        realtime=True,
+    )
+
+    _WAIT_SECONDS = 3.0
+
+    async with create_connected_server_and_client_session(session.mcp) as client:
+
+        async def _game_time() -> float:
+            r = await client.call_tool("execute_code", {"code": "bot.observe().game_time"})
+            return float(_payload(r)["result"])
+
+        t0 = await _game_time()
+        await asyncio.sleep(_WAIT_SECONDS)
+        t1 = await _game_time()
+        delta = t1 - t0
+
+        assert delta > _WAIT_SECONDS * 0.5, (
+            f"game_time advanced by only {delta:.3f}s across a {_WAIT_SECONDS:.1f}s real-world "
+            "wait between two execute_code calls with realtime=True -- expected it to closely "
+            "track the real wait, proving on_step's per-dequeue refresh (ticket #21) picked up "
+            "the server's current state rather than whatever was cached from before on_step "
+            "started waiting on the queue."
+        )
+
+        r = await client.call_tool("execute_code", {"code": "await sdk.client.leave()"})
+        assert _payload(r)["ok"] is True
+
+    result = await asyncio.wait_for(session.game_task, timeout=30)
+    assert result == Result.Defeat

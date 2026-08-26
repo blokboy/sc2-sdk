@@ -87,6 +87,46 @@ _POLL_FRAMES = 4
 _DEFAULT_MAX_WAIT_STEPS = 5
 
 
+async def refresh_realtime_state(ai: BotAI, frames: int = 0) -> None:
+    """Flush queued actions and refresh `ai`'s state (`ai.state`/`ai.units`/
+    etc.) to the server's own free-running game loop, `frames` loops ahead
+    of whatever `ai.state.game_loop` currently is -- the realtime-mode
+    equivalent of manually stepping the simulation (which, unlike
+    non-realtime mode, isn't legal here; see `Bot._advance_realtime`'s
+    docstring below, which this function was factored out of).
+
+    `frames=0` (the default) means "refresh to whatever the server's
+    current loop already is" rather than "wait for N more loops to
+    elapse": since realtime mode's engine free-runs on its own wall-clock
+    timer independently of Python, `ai.state.game_loop` going into this
+    call is already whatever loop was last observed -- typically some real
+    time in the past by the time this coroutine actually runs -- so the
+    server's own current loop is normally already at or past
+    `target_loop`, and `client.observation(target_loop)` returns as soon as
+    its round trip completes, with no additional waiting. (Only if this is
+    called back-to-back with essentially no elapsed wall-clock time could
+    the server's loop not yet have reached `target_loop`, in which case
+    this waits for one more tick -- still on the order of the server's own
+    tick rate, not an open-ended block.)
+
+    Shared by `Bot._advance_realtime` (verification polling, which passes
+    a positive `frames` to wait for actual progress) and
+    `ExecuteCodeBotAI.on_step` (`sdk/mcp_server.py`, ticket #21: refreshing
+    state once per dequeued request, with `frames=0`, to close the "state
+    is stale by however long the caller took composing its next call" gap)
+    -- both need the identical flush-observe-rebuild-reprepare sequence,
+    just for different reasons and different target loops, so it lives
+    here once rather than being reimplemented at the second call site.
+    """
+    await ai._after_step()  # noqa: SLF001 -- see this class's _advance docstring
+    target_loop = ai.state.game_loop + frames
+    state = await ai.client.observation(target_loop)
+    gs = GameState(state.observation)
+    proto_game_info = await ai.client._execute(game_info=sc_pb.RequestGameInfo())  # noqa: SLF001
+    ai._prepare_step(gs, proto_game_info)  # noqa: SLF001
+    await ai.issue_events()
+
+
 class Bot:
     """Wraps a live `BotAI` instance with the verified `bot.*` API.
 
@@ -164,15 +204,12 @@ class Bot:
         `_advance_steps`, this never sends a `RequestStep`. The rest
         mirrors `_advance_steps` exactly (same private hooks, same
         reasoning for reaching into them -- see this class's `_advance`
-        and the module docstring)."""
-        ai = self._ai
-        await ai._after_step()  # noqa: SLF001 -- see module docstring
-        target_loop = ai.state.game_loop + frames
-        state = await ai.client.observation(target_loop)
-        gs = GameState(state.observation)
-        proto_game_info = await ai.client._execute(game_info=sc_pb.RequestGameInfo())  # noqa: SLF001
-        ai._prepare_step(gs, proto_game_info)  # noqa: SLF001
-        await ai.issue_events()
+        and the module docstring). Delegates to the module-level
+        `refresh_realtime_state`, which this method's implementation was
+        factored out into (ticket #21) so `ExecuteCodeBotAI.on_step` could
+        reuse the identical sequence for its own per-dequeue staleness
+        refresh without duplicating it."""
+        await refresh_realtime_state(self._ai, frames)
 
     def _resolve_units(self, units: Unit | Units | int | list) -> tuple[list[Unit], list[int]]:
         """Normalize a caller-supplied unit selector (a Unit, a tag, or an
