@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import subprocess
 import sys
 import time
@@ -27,12 +28,23 @@ from pathlib import Path
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 from sc2.data import Race, Result
+from sc2.portconfig import Portconfig
 
+from sdk.matchcode import encode_match_code
 from sdk.mcp_server import DEFAULT_MAP, serve_execute_code
 
 _SAFETY_TIME_LIMIT = 20 * 60  # in-game seconds
 _HOST_JOIN_TIMEOUT = 90.0  # host CLI's own --timeout (seconds to wait for a peer)
 _MATCH_CODE_WAIT_TIMEOUT_S = 60.0
+
+#: Ticket #18's own fix -- see the (removed) NOTE this test replaces below.
+#: Short join_timeout so this doesn't spend minutes waiting it out, plus a
+#: hard outer bound (via asyncio.wait_for) so a regression back to the
+#: pre-fix hang fails this test loudly within a couple of minutes instead
+#: of hanging CI -- see tests/integration/test_host_game_mcp.py's identical
+#: reasoning for the hosting side of this exact same defect.
+_NO_HOST_JOIN_TIMEOUT_S = 10.0
+_NO_HOST_OUTER_BOUND_S = 150.0
 
 _BIN_DIR = Path(sys.executable).parent
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -144,21 +156,57 @@ def test_join_game_fails_promptly_on_an_undecodable_code():
         decode_match_code("not-a-real-match-code")
 
 
-# NOTE: a real end-to-end "no host is actually listening -> join_game raises
-# within join_timeout instead of hanging" test is deliberately NOT included
-# here. Probing it manually against a real local SC2 client on this platform
-# reproduced the same defect tests/integration/test_host_game_mcp.py already
-# documented for the hosting role (see its own NOTE, and issue #18): both
-# `_run_host_role` and `_run_join_role`'s "wait for the peer" step bottom out
-# in the exact same `sdk.matchcode.wait_for_joiner(_join_game_at(...), ...)`
-# call (see `sdk/join.py`) -- `_run_join_role`'s own `_connect()` closure IS
-# just `_join_game_at`, the same call `_run_host_role`'s `_connect()` makes
-# after `create_game`. So this is not a second, join-side-specific defect:
-# it's the same #18 defect, now confirmed reachable from both roles, not
-# something `join_game`'s own code (`_launch_joined_game`/
-# `_await_connected_or_failure`) can fix without touching `sdk.join`/
-# `sdk.matchcode` -- both explicitly "kept separate/untouched" per their own
-# docstrings, and out of this ticket's scope. `_await_connected_or_failure`'s
-# own logic (raising game_task's exception once it actually finishes) is
-# covered without a real client by the unit tests in
-# tests/test_join_game_helpers.py.
+@pytest.mark.integration
+def test_join_game_fails_within_join_timeout_when_no_host_is_listening(sc2_install):
+    """Ticket #18 (https://github.com/blokboy/sc2-sdk/issues/18): a real
+    end-to-end "no host is actually listening -> join_game raises within
+    join_timeout instead of hanging" repro -- previously deliberately left
+    out of this file (see the removed NOTE this test replaces) because
+    probing it manually reproduced the same hang
+    `tests/integration/test_host_game_mcp.py` documented for the hosting
+    role: both `_run_host_role` and `_run_join_role`'s "wait for the peer"
+    step bottom out in the exact same
+    `sdk.matchcode.wait_for_joiner(_join_game_at(...), ...)` call (see
+    `sdk/join.py`) -- `_run_join_role`'s own `_connect()` closure IS just
+    `_join_game_at`, the same call `_run_host_role`'s `_connect()` makes
+    after `create_game`. So this was never a second, join-side-specific
+    defect, and the same fix (see `wait_for_joiner`'s docstring) covers it.
+
+    No real `sc2-sdk-host` process is launched here: a match code is built
+    directly (`encode_match_code`) around a fresh `Portconfig()` nothing is
+    ever listening on, which is enough to reproduce "a peer this side is
+    told to expect never shows up" without needing a second real client.
+
+    Wrapped in an outer `asyncio.wait_for` so a regression back to the
+    pre-fix hang fails this test loudly within `_NO_HOST_OUTER_BOUND_S`
+    instead of hanging CI.
+    """
+    asyncio.run(asyncio.wait_for(_run_no_host_listening(), timeout=_NO_HOST_OUTER_BOUND_S))
+
+
+async def _run_no_host_listening() -> None:
+    portconfig = Portconfig()
+    try:
+        fake_code = encode_match_code(
+            host_ip="127.0.0.1",
+            portconfig=portconfig,
+            map_name=DEFAULT_MAP,
+            race_pin=None,
+            token=secrets.token_urlsafe(16),
+        )
+
+        session = await serve_execute_code(
+            map_name=DEFAULT_MAP,
+            my_race=Race.Terran,
+            game_time_limit=_SAFETY_TIME_LIMIT,
+        )
+        async with create_connected_server_and_client_session(session.mcp) as client:
+            r = await client.call_tool(
+                "join_game",
+                {"code": fake_code, "race": "zerg", "join_timeout": _NO_HOST_JOIN_TIMEOUT_S},
+            )
+            assert r.isError, r
+            assert len(r.content) == 1
+            assert "No joiner connected within" in r.content[0].text, r.content
+    finally:
+        portconfig.clean()
