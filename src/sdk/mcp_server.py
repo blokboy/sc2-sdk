@@ -457,7 +457,7 @@ from sc2.sc2process import SC2Process  # noqa: SLF001 -- see _patched_sc2process
 from mcp.server.fastmcp import FastMCP
 
 from install.paths import BINARY_NAME, platform_name
-from sdk.bot import VerifiedBotAI
+from sdk.bot import VerifiedBotAI, refresh_realtime_state
 from sdk.host_join import DEFAULT_JOIN_TIMEOUT
 from sdk.join import _run_host_role, _run_join_role  # noqa: SLF001 -- see this module's "Hosting a two-player match" section
 from sdk.matchcode import JoinTimeoutError, decode_match_code, encode_match_code, resolve_race
@@ -485,6 +485,33 @@ DEFAULT_MAP = "AutomatonLE"
 #: default is overridden per-server (`--snippet-timeout`) and persists
 #: across `new_game` calls.
 DEFAULT_SNIPPET_TIMEOUT_SECONDS = 45.0
+
+#: Bounded timeout (in seconds) for the realtime state-refresh RPC `on_step`
+#: performs right after dequeuing a request, before handing it to
+#: `_eval_snippet` -- ticket #21 (realtime think-time staleness gap): in
+#: realtime mode the SC2 server free-runs on its own wall-clock timer while
+#: `on_step` is blocked on `self._queue.get()`, so the state a snippet would
+#: otherwise see is stale by however long the caller took composing that
+#: call. See `on_step` for the full mechanism (`sdk.bot.refresh_realtime_state`,
+#: the same flush-observe-rebuild sequence `Bot._advance_realtime` already
+#: used for verification polling, called with `frames=0` for "catch up to
+#: whatever the server's current loop already is").
+#:
+#: This is a *separate* timeout from `request.timeout_seconds` -- it guards
+#: SDK plumbing overhead, not the snippet's own execution budget, and must
+#: not eat into it. Per this module's "nothing inside on_step may block
+#: unboundedly" rule (see the module docstring's "Per-call timeout and
+#: single automatic retry" section -- the same rule that motivated that
+#: mechanism in the first place), this refresh needs its own bound rather
+#: than being left as a new unbounded await. 2 seconds: this is a single
+#: local RPC round trip to an already-running SC2 process on the same
+#: machine (no network hop), which normally completes in well under 100ms
+#: -- 2s leaves generous headroom for a transient scheduling hiccup while
+#: still being short enough that a genuinely wedged client is caught
+#: quickly (the refresh degrades gracefully on timeout -- see `on_step` --
+#: rather than failing the caller's call, so there is no benefit to a
+#: larger value beyond "clearly implausible for a healthy local RPC").
+REALTIME_STATE_REFRESH_TIMEOUT_SECONDS = 2.0
 
 #: Default `start_task` `max_iterations` -- see the module docstring's
 #: "Standing background tasks" section for the overall mechanism. This
@@ -1495,6 +1522,51 @@ class ExecuteCodeBotAI(VerifiedBotAI):
         # (python-sc2 itself only calls on_step once at a time, awaiting
         # each call to return before the next), and this is its only body.
         request = await self._queue.get()
+
+        # Ticket #21: in realtime mode, the SC2 server free-runs on its own
+        # wall-clock timer the whole time on_step was blocked on the
+        # queue.get() above -- so self.state/self.units (whatever
+        # _eval_snippet is about to see via self.bot/self.sdk) reflects
+        # whatever was current *before* that wait started, stale by
+        # roughly however long the caller took composing this call. Refresh
+        # to the server's current game loop here, BEFORE _eval_snippet
+        # runs and OUTSIDE the request.timeout_seconds budget below -- this
+        # refresh is SDK plumbing overhead, not part of the snippet's own
+        # execution budget, so it must not eat into it (a separate,
+        # dedicated timeout guards it instead; see
+        # REALTIME_STATE_REFRESH_TIMEOUT_SECONDS).
+        #
+        # Non-realtime (stepped) mode is a deliberate no-op here: nothing
+        # else advances the engine between calls in that mode, so the state
+        # on_step was entered with is already fully fresh -- see
+        # REALTIME_STATE_REFRESH_TIMEOUT_SECONDS's docstring and ticket
+        # #21's "Design decisions already made" section.
+        #
+        # This applies once per dequeued request, at this shared point --
+        # covering both an ordinary execute_code call and a start_task turn
+        # automatically, without special-casing either, since both flow
+        # through this exact same queue.get() above.
+        if self.realtime:
+            try:
+                await asyncio.wait_for(
+                    refresh_realtime_state(self), timeout=REALTIME_STATE_REFRESH_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Per ticket #21's safety requirements: degrade gracefully
+                # rather than failing the caller's call over this alone --
+                # log and proceed with whatever state is currently cached,
+                # i.e. fall back to exactly today's pre-fix behavior for
+                # this one call. A genuinely stuck/dead SC2 client will
+                # still surface loudly and quickly regardless, since the
+                # snippet's own bot.*/sdk.* calls right afterward hit the
+                # same client and would fail/timeout too.
+                what = f"task {request.task_id!r} turn" if request.task_id else "an execute_code call"
+                logger.warning(
+                    "sc2-sdk-mcp: realtime state refresh timed out after "
+                    f"{REALTIME_STATE_REFRESH_TIMEOUT_SECONDS:g}s before {what}; "
+                    "proceeding with the currently cached state instead."
+                )
+
         try:
             result = await asyncio.wait_for(
                 _eval_snippet(request.code, {"bot": self.bot, "sdk": self.sdk}),
