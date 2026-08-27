@@ -31,8 +31,11 @@ If it printed an `export SC2PATH=...` line (only happens with a non-default
 
 ## Confirm you're connection-ready
 
-Run the dedicated smoke test yourself right after "Get running" -- don't
-leave the user wondering whether setup actually worked.
+Only run this on initial setup -- i.e. when "Get running" just created
+`.venv` rather than reusing an existing one -- or when the user explicitly
+asks to confirm/verify the connection. Don't run it on every session against
+an already-set-up repo; it launches a real SC2 game each time, which is
+excessive overhead for a routine session start.
 
 ```bash
 pytest -q tests/integration/test_connection_smoke.py
@@ -45,7 +48,7 @@ unit or integration suites as part of setup or before ordinary play; those
 are development/CI checks and should only be run when the task calls for
 them.
 
-Report the outcome plainly:
+When it does run, report the outcome plainly:
 
 - the smoke test ran (not skipped) and passed -- tell the user they have a
   working, connected client and are ready to play.
