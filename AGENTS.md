@@ -83,6 +83,54 @@ only mode. The confirmation gate above returns, scoped specifically to
 whatever opts into Tailscale, once cross-machine multiplayer over MCP is
 built.
 
+## Writing `execute_code` snippets
+
+One action per call, and never wait inside a snippet. This matters most
+during a live realtime match, and it's easy to get wrong because the
+anti-pattern reads so reasonably:
+
+```python
+# DON'T -- this stalls the entire game
+for _ in range(30):
+    if sdk.minerals >= 310:
+        break
+    await bot._advance(8)
+loc = await sdk.get_next_expansion()
+await bot.build(UnitTypeId.COMMANDCENTER, near=loc)
+```
+
+Three things compound to make that far more expensive than it looks:
+
+- **A snippet holds the game's only queue.** `ExecuteCodeBotAI.on_step`
+  services exactly one request at a time, and `start_task` turns drain from
+  that *same* queue -- so for as long as a snippet runs, every background
+  task gets zero turns and supply/worker/unit production all stop. A snippet
+  that waits for minerals is starving the tasks that would spend them.
+- **Waiting costs real wall-clock time in realtime mode.** `bot._advance(8)`
+  waits for the server's free-running clock to advance 8 game loops
+  (~0.36s), so a 30-iteration loop is ~11s. Each `bot.build()` adds its own
+  verification budget on top -- up to ~15s in realtime, because a worker
+  physically walks to the site (see `_REALTIME_BUILD_MAX_WAIT_STEPS`).
+- **A timeout re-runs the whole snippet.** On timeout the server retries
+  once, from the top (see `mcp_server.py`'s "Per-call timeout and single
+  automatic retry"), so an over-long snippet stalls the game for roughly
+  twice its timeout and can still end up having built nothing.
+
+Instead:
+
+- Put "keep doing X until Y" in `start_task`. That's what it's for: one
+  bounded turn per `on_step`, interleaved fairly with everything else,
+  rather than one snippet monopolising the queue.
+- Keep `execute_code` to a single decision and its order, passing a small
+  `max_wait_steps` (e.g. 4) when you only need the command dispatched and
+  don't need the effect verified.
+- Read state in one short call, decide, act in the next. Between two calls
+  the realtime engine advances on its own -- that *is* your wait.
+
+Measured cost of getting this wrong, once: two 75s timeouts back to back
+(~150s of game time) with every background task frozen, straight through an
+enemy attack that went uncontested as a result.
+
 ## Also read
 
 - `CLAUDE.md` -- issue tracker, triage labels, and domain-doc conventions.
