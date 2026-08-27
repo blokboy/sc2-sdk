@@ -275,6 +275,12 @@ async def move(self, units: Unit | Units | int | list, target: Point2 | Unit, qu
 Move a unit or unit group to `target`, and confirm each unit
 actually picked up a move order.
 
+`target` is a `Point2` or a `Unit`. A bare `(x, y)` number pair is
+also accepted and converted to `Point2`; any other target is
+rejected up front with `ok=False` and nothing is dispatched, rather
+than being queued for python-sc2 to choke on during a later flush
+(see `_normalize_move_target`).
+
 `max_wait_steps` defaults to `None`, which resolves to
 `_MOVE_DEFAULT_MAX_WAIT_STEPS` (non-realtime, 3) or
 `_REALTIME_MOVE_MAX_WAIT_STEPS` (realtime) -- see
@@ -289,7 +295,8 @@ async def attack_move(self, units: Unit | Units | int | list, target: Point2 | U
 
 Attack-move a unit or unit group toward `target`, and confirm
 each unit actually picked up an attack order. See `move`'s docstring
-for `max_wait_steps`'s default-resolution behavior.
+for `target`'s accepted forms and `max_wait_steps`'s
+default-resolution behavior.
 
 #### `Bot.chat`
 

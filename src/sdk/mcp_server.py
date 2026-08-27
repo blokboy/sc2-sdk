@@ -1508,6 +1508,62 @@ class ExecuteCodeBotAI(VerifiedBotAI):
         await super().on_start()
         self.ready.set()
 
+    async def _drain_pending_actions(self) -> str | None:
+        """Flush whatever the snippet left queued in `self.actions`, and
+        guarantee the queue is empty afterwards either way. Returns None on
+        success, or a description of the failure.
+
+        This is the guard for the RAW `sdk.*` tier specifically. A verified
+        `bot.*` action flushes through `sdk.bot`'s own `_advance`, which has
+        its own guard (`_discard_pending_actions`) -- but a snippet that
+        reaches past `bot.*` and calls e.g. `sdk.do(...)` or a `Unit` method
+        directly queues a command that nothing flushes until python-sc2's
+        own `_after_step()` runs, AFTER `on_step` returns. If python-sc2
+        refuses to serialize that command (a malformed target is the
+        realistic case -- see `sdk.bot._normalize_move_target`), the
+        exception is raised out there, where `_eval_snippet` can no longer
+        catch it: it propagates out of the game task, `SC2Process.__aexit__`
+        tears the SC2 client down, and every later `execute_code` call gets
+        the dead task's exception back through `submit`. One bad snippet
+        ends the match.
+
+        Draining here moves that flush inside `on_step`, where a failure is
+        attributable to the snippet that caused it and is reported as an
+        ordinary `ok=False` result. `self.actions` is cleared BEFORE the
+        await so that a cancellation mid-flush can't strand the batch
+        either. python-sc2's own outer `_after_step()` then finds the queue
+        empty and skips `_do_actions` entirely -- so this replaces that
+        flush rather than duplicating it.
+        """
+        if not self.actions:
+            return None
+        pending = list(self.actions)
+        self.actions.clear()
+        try:
+            await self._do_actions(pending)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: nothing above us can catch this
+            self.unit_tags_received_action.clear()
+            return (
+                f"{len(pending)} queued raw sdk.* command(s) were rejected by python-sc2 while "
+                f"being sent and have been discarded: {type(exc).__name__}: {exc}. "
+                "This usually means a command was built with an invalid target -- pass a Point2 "
+                "(from sc2.position import Point2) or a Unit, not a bare tuple. Prefer the "
+                "verified bot.* actions, which validate targets before queueing anything."
+            )
+        return None
+
+    def _with_flush_error(self, result: ExecuteCodeResult, flush_error: str) -> ExecuteCodeResult:
+        """Fold a `_drain_pending_actions` failure into the result the
+        caller gets back, so a discarded command is reported rather than
+        silently dropped. An already-failing result keeps its own error
+        first -- the snippet's own exception is the more useful of the
+        two, and is usually the cause of the flush failure anyway."""
+        return dataclasses.replace(
+            result,
+            ok=False,
+            error=f"{result.error}\n\n{flush_error}" if result.error else flush_error,
+        )
+
     async def on_step(self, iteration: int) -> None:
         # This blocking get() -- not any change to python-sc2's own
         # stepping code -- is the entire mechanism behind "the game runs in
@@ -1584,6 +1640,14 @@ class ExecuteCodeBotAI(VerifiedBotAI):
             # snippet does, reusing this exact branch rather than a
             # parallel implementation (see the module docstring's
             # "Standing background tasks" section).
+            #
+            # Drain before either timeout path returns: a snippet cancelled
+            # mid-flight can have queued commands too, and they must not
+            # reach python-sc2's outer flush (see _drain_pending_actions).
+            drain_error = await self._drain_pending_actions()
+            if drain_error is not None:
+                logger.warning(f"sc2-sdk-mcp: {drain_error}")
+
             if request.attempt < 2:
                 # First timeout: leave the caller's future unresolved (its
                 # execute_code MCP call stays pending) and move this exact
@@ -1623,6 +1687,14 @@ class ExecuteCodeBotAI(VerifiedBotAI):
             elif request.future is not None and not request.future.done():
                 request.future.set_result(timeout_result)
             return
+
+        # Normal path: flush the snippet's own raw sdk.* commands here,
+        # inside on_step, so a command python-sc2 can't serialize fails THIS
+        # call instead of escaping into the outer _after_step() and killing
+        # the game task (see _drain_pending_actions).
+        drain_error = await self._drain_pending_actions()
+        if drain_error is not None:
+            result = self._with_flush_error(result, drain_error)
 
         if request.task_id is not None:
             self._finish_task_turn(request.task_id, result)

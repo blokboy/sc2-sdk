@@ -190,6 +190,76 @@ _REALTIME_MOVE_MAX_WAIT_STEPS = 5
 _REALTIME_BUILD_MAX_WAIT_STEPS = 170
 
 
+def _discard_pending_actions(ai: BotAI) -> None:
+    """Drop python-sc2's pending action batch after a flush of it raised.
+
+    python-sc2's `_after_step` only clears `ai.actions` *after*
+    `_do_actions` returns successfully::
+
+        if self.actions:
+            await self._do_actions(self.actions)
+            self.actions.clear()
+
+    A command python-sc2 rejects locally while *serializing* it (rather
+    than server-side) therefore stays queued when that flush raises.
+    Whoever triggered the flush does see the exception -- `_eval_snippet`
+    turns it into a structured error for the caller -- but the malformed
+    command is still sitting in `ai.actions`, and python-sc2's own outer
+    `_after_step()` after `on_step` returns then re-raises it with nobody
+    left to catch it: the game task dies and `SC2Process.__aexit__` tears
+    down the SC2 client, which from the other side of a two-player match
+    looks exactly like the peer dropping its connection. See
+    `mcp_server.ExecuteCodeBotAI._drain_pending_actions` for the matching
+    guard on the raw `sdk.*` path, which never touches a flush here at all.
+
+    Dropping the whole batch is deliberate. It is a plain list of
+    already-built `UnitCommand`s with no per-command dispatch record, so
+    there's no way to tell which one python-sc2 choked on and re-send only
+    the innocent rest. Losing the rest of one snippet's commands is
+    strictly better than poisoning every subsequent flush for the
+    remainder of the match.
+    """
+    ai.actions.clear()
+    ai.unit_tags_received_action.clear()
+
+
+def _normalize_move_target(target: object) -> tuple[Point2 | Unit | None, str | None]:
+    """Coerce a caller-supplied move/attack-move target into something
+    python-sc2 can actually serialize, or explain why it can't.
+
+    Returns `(resolved, None)` on success and `(None, error)` on failure --
+    never raises, so `_move_or_attack` can report a bad target as an
+    ordinary `ok=False` MoveOutcome, the same way it already reports an
+    unknown unit tag, instead of queueing input that will detonate later.
+
+    Validating here rather than trusting the `Point2 | Unit` annotation is
+    the point: python-sc2's own `UnitCommand` construction *accepts* a bare
+    `(x, y)` tuple and only rejects it much later, while serializing the
+    queued command during a flush -- far from the call that caused it, and
+    (before `_discard_pending_actions` above) fatal to the whole match.
+
+    A 2-number sequence is normalized to `Point2` rather than refused: it's
+    the single most common way a caller writes a map coordinate, it has
+    exactly one sensible meaning, and accepting it costs nothing. Anything
+    else is refused up front, before a command is ever built or queued.
+    """
+    if isinstance(target, (Point2, Unit)):
+        return target, None
+    # NOTE: Point2 subclasses tuple, so this check must stay BELOW the
+    # isinstance check above or it would re-wrap every Point2 that arrives.
+    if (
+        isinstance(target, (tuple, list))
+        and len(target) == 2
+        and all(isinstance(coord, (int, float)) and not isinstance(coord, bool) for coord in target)
+    ):
+        return Point2((float(target[0]), float(target[1]))), None
+    return None, (
+        f"Invalid target {target!r} ({type(target).__name__}): move/attack_move take a "
+        "Point2 or a Unit (a bare (x, y) number pair is also accepted and converted). "
+        "Use Point2((x, y)) -- from sc2.position import Point2."
+    )
+
+
 async def refresh_realtime_state(ai: BotAI, frames: int = 0) -> None:
     """Flush queued actions and refresh `ai`'s state (`ai.state`/`ai.units`/
     etc.) to the server's own free-running game loop, `frames` loops ahead
@@ -221,7 +291,16 @@ async def refresh_realtime_state(ai: BotAI, frames: int = 0) -> None:
     just for different reasons and different target loops, so it lives
     here once rather than being reimplemented at the second call site.
     """
-    await ai._after_step()  # noqa: SLF001 -- see this class's _advance docstring
+    try:
+        await ai._after_step()  # noqa: SLF001 -- see this class's _advance docstring
+    except Exception:
+        # A command python-sc2 refuses to serialize would otherwise stay
+        # queued and re-raise on the next flush, outside any caller's
+        # protection -- see _discard_pending_actions. Re-raise either way:
+        # the caller still needs to see what failed, it just must not stay
+        # queued for the outer step to trip over.
+        _discard_pending_actions(ai)
+        raise
     target_loop = ai.state.game_loop + frames
     state = await ai.client.observation(target_loop)
     gs = GameState(state.observation)
@@ -301,9 +380,19 @@ class Bot:
         `_advance_steps`'s own upstream docstring warns about, and
         empirically stalled for tens of real seconds per call."""
         if self._ai.realtime:
+            # _advance_realtime -> refresh_realtime_state, which guards its
+            # own flush (see there); nothing to add on this branch.
             await self._advance_realtime(frames if frames is not None else _REALTIME_POLL_FRAMES)
         else:
-            await self._ai._advance_steps(frames if frames is not None else _POLL_FRAMES)  # noqa: SLF001 -- see module docstring
+            try:
+                await self._ai._advance_steps(frames if frames is not None else _POLL_FRAMES)  # noqa: SLF001 -- see module docstring
+            except Exception:
+                # _advance_steps opens with its own _after_step() flush, so
+                # it can strand a malformed command in ai.actions exactly
+                # the way refresh_realtime_state can -- same guard, same
+                # reasoning (see _discard_pending_actions).
+                _discard_pending_actions(self._ai)
+                raise
 
     async def _advance_realtime(self, frames: int) -> None:
         """Realtime-mode equivalent of `BotAI._advance_steps` that waits
@@ -725,6 +814,12 @@ class Bot:
         """Move a unit or unit group to `target`, and confirm each unit
         actually picked up a move order.
 
+        `target` is a `Point2` or a `Unit`. A bare `(x, y)` number pair is
+        also accepted and converted to `Point2`; any other target is
+        rejected up front with `ok=False` and nothing is dispatched, rather
+        than being queued for python-sc2 to choke on during a later flush
+        (see `_normalize_move_target`).
+
         `max_wait_steps` defaults to `None`, which resolves to
         `_MOVE_DEFAULT_MAX_WAIT_STEPS` (non-realtime, 3) or
         `_REALTIME_MOVE_MAX_WAIT_STEPS` (realtime) -- see
@@ -742,7 +837,8 @@ class Bot:
     ) -> MoveOutcome:
         """Attack-move a unit or unit group toward `target`, and confirm
         each unit actually picked up an attack order. See `move`'s docstring
-        for `max_wait_steps`'s default-resolution behavior."""
+        for `target`'s accepted forms and `max_wait_steps`'s
+        default-resolution behavior."""
         return await self._move_or_attack("attack_move", units, target, queue, max_wait_steps)
 
     async def _move_or_attack(
@@ -786,8 +882,28 @@ class Bot:
                 confirmed_tags=(),
             )
 
+        # Validate the target BEFORE building/queueing a single command: an
+        # unserializable target isn't just this call's problem, it strands a
+        # malformed command in ai.actions that kills the next flush (see
+        # _normalize_move_target and _discard_pending_actions).
+        resolved_target, target_error = _normalize_move_target(target)
+        if target_error is not None:
+            return MoveOutcome(
+                ok=False,
+                effect_confirmed=False,
+                error=target_error,
+                detail="Command not dispatched: invalid move/attack-move target.",
+                mode=mode,
+                requested_tags=requested_tags,
+                confirmed_tags=(),
+            )
+
         for unit in found:
-            command = unit.attack(target, queue=queue) if mode == "attack_move" else unit.move(target, queue=queue)
+            command = (
+                unit.attack(resolved_target, queue=queue)
+                if mode == "attack_move"
+                else unit.move(resolved_target, queue=queue)
+            )
             ai.do(command, ignore_warning=True)
 
         confirmed_tags: set[int] = set()
