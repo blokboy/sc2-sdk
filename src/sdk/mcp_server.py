@@ -447,6 +447,7 @@ import psutil
 from loguru import logger
 
 from sc2 import maps
+from sc2.action import combine_actions
 from sc2.data import Difficulty, Race, Result
 from sc2.main import _host_game  # noqa: SLF001 -- see module docstring
 from sc2.player import Bot as Sc2BotPlayer
@@ -457,7 +458,7 @@ from sc2.sc2process import SC2Process  # noqa: SLF001 -- see _patched_sc2process
 from mcp.server.fastmcp import FastMCP
 
 from install.paths import BINARY_NAME, platform_name
-from sdk.bot import VerifiedBotAI, refresh_realtime_state
+from sdk.bot import VerifiedBotAI, _discard_pending_actions, refresh_realtime_state
 from sdk.host_join import DEFAULT_JOIN_TIMEOUT
 from sdk.join import _run_host_role, _run_join_role  # noqa: SLF001 -- see this module's "Hosting a two-player match" section
 from sdk.matchcode import JoinTimeoutError, decode_match_code, encode_match_code, resolve_race
@@ -1508,10 +1509,12 @@ class ExecuteCodeBotAI(VerifiedBotAI):
         await super().on_start()
         self.ready.set()
 
-    async def _drain_pending_actions(self) -> str | None:
-        """Flush whatever the snippet left queued in `self.actions`, and
-        guarantee the queue is empty afterwards either way. Returns None on
-        success, or a description of the failure.
+    def _preflight_pending_actions(self) -> str | None:
+        """Validate pending raw ``sdk.*`` actions without dispatching them.
+
+        Returns ``None`` when python-sc2 can serialize the batch. If local
+        serialization fails, discards the poisoned batch and returns an
+        actionable description of the failure.
 
         This is the guard for the RAW `sdk.*` tier specifically. A verified
         `bot.*` action flushes through `sdk.bot`'s own `_advance`, which has
@@ -1527,41 +1530,48 @@ class ExecuteCodeBotAI(VerifiedBotAI):
         the dead task's exception back through `submit`. One bad snippet
         ends the match.
 
-        Draining here moves that flush inside `on_step`, where a failure is
-        attributable to the snippet that caused it and is reported as an
-        ordinary `ok=False` result. `self.actions` is cleared BEFORE the
-        await so that a cancellation mid-flush can't strand the batch
-        either. python-sc2's own outer `_after_step()` then finds the queue
-        empty and skips `_do_actions` entirely -- so this replaces that
-        flush rather than duplicating it.
+        Preflighting here keeps the failure attributable to the snippet
+        while leaving valid commands for python-sc2's normal outer
+        ``_after_step`` flush. It deliberately performs no transport I/O:
+        python-sc2's protocol waits for an outstanding response when a
+        request is cancelled, so moving that RPC inside ``on_step`` would
+        create a new unbounded path outside the snippet timeout.
         """
         if not self.actions:
             return None
         pending = list(self.actions)
-        self.actions.clear()
         try:
-            await self._do_actions(pending)
+            actions = list(filter(self.prevent_double_actions, pending))
+            list(combine_actions(actions))
         except Exception as exc:  # noqa: BLE001 -- see docstring: nothing above us can catch this
+            self.actions.clear()
             self.unit_tags_received_action.clear()
             return (
                 f"{len(pending)} queued raw sdk.* command(s) were rejected by python-sc2 while "
-                f"being sent and have been discarded: {type(exc).__name__}: {exc}. "
+                f"being serialized and have been discarded: {type(exc).__name__}: {exc}. "
                 "This usually means a command was built with an invalid target -- pass a Point2 "
                 "(from sc2.position import Point2) or a Unit, not a bare tuple. Prefer the "
                 "verified bot.* actions, which validate targets before queueing anything."
             )
         return None
 
-    def _with_flush_error(self, result: ExecuteCodeResult, flush_error: str) -> ExecuteCodeResult:
-        """Fold a `_drain_pending_actions` failure into the result the
-        caller gets back, so a discarded command is reported rather than
-        silently dropped. An already-failing result keeps its own error
-        first -- the snippet's own exception is the more useful of the
-        two, and is usually the cause of the flush failure anyway."""
+    def _with_action_preflight_error(
+        self, result: ExecuteCodeResult, preflight_error: str
+    ) -> ExecuteCodeResult:
+        """Fold a pending-action preflight failure into the caller result.
+
+        An already-failing result keeps its own error first -- the snippet's
+        exception is generally the most useful context for the malformed
+        action it left behind.
+        """
         return dataclasses.replace(
             result,
             ok=False,
-            error=f"{result.error}\n\n{flush_error}" if result.error else flush_error,
+            error=(
+                f"{result.error}\n\n{preflight_error}"
+                if result.error
+                else preflight_error
+            ),
         )
 
     async def on_step(self, iteration: int) -> None:
@@ -1641,12 +1651,18 @@ class ExecuteCodeBotAI(VerifiedBotAI):
             # parallel implementation (see the module docstring's
             # "Standing background tasks" section).
             #
-            # Drain before either timeout path returns: a snippet cancelled
-            # mid-flight can have queued commands too, and they must not
-            # reach python-sc2's outer flush (see _drain_pending_actions).
-            drain_error = await self._drain_pending_actions()
-            if drain_error is not None:
-                logger.warning(f"sc2-sdk-mcp: {drain_error}")
+            # A cancelled snippet can leave commands queued locally. Their
+            # dispatch status is uncertain, and this same code may run once
+            # more under the retry policy below, so sending the leftover
+            # batch here could duplicate its effects. Discard it without
+            # transport I/O before returning to python-sc2's outer flush.
+            discarded_actions = len(self.actions)
+            if discarded_actions:
+                _discard_pending_actions(self)
+                logger.warning(
+                    "sc2-sdk-mcp: discarded "
+                    f"{discarded_actions} pending raw sdk.* command(s) after snippet timeout."
+                )
 
             if request.attempt < 2:
                 # First timeout: leave the caller's future unresolved (its
@@ -1688,13 +1704,14 @@ class ExecuteCodeBotAI(VerifiedBotAI):
                 request.future.set_result(timeout_result)
             return
 
-        # Normal path: flush the snippet's own raw sdk.* commands here,
-        # inside on_step, so a command python-sc2 can't serialize fails THIS
-        # call instead of escaping into the outer _after_step() and killing
-        # the game task (see _drain_pending_actions).
-        drain_error = await self._drain_pending_actions()
-        if drain_error is not None:
-            result = self._with_flush_error(result, drain_error)
+        # Validate the snippet's raw sdk.* commands locally so a command
+        # python-sc2 can't serialize fails THIS call instead of escaping
+        # into the outer _after_step() and killing the game task. Valid
+        # commands remain queued for that normal outer flush; no transport
+        # I/O occurs here (see _preflight_pending_actions).
+        preflight_error = self._preflight_pending_actions()
+        if preflight_error is not None:
+            result = self._with_action_preflight_error(result, preflight_error)
 
         if request.task_id is not None:
             self._finish_task_turn(request.task_id, result)

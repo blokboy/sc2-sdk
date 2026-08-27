@@ -22,23 +22,25 @@ Three layers are covered here, one per contributing defect:
      `(x, y)` pair normalized) BEFORE any command is built or queued.
   2. `Bot._move_or_attack` -- an invalid target returns `ok=False` having
      queued NOTHING, so no later flush has anything to choke on.
-  3. `ExecuteCodeBotAI._drain_pending_actions` -- for a raw `sdk.*`
-     command that bypasses (1) and (2) entirely, a flush failure is
-     contained inside `on_step` and reported as an ordinary failed result,
+  3. `ExecuteCodeBotAI.on_step` -- for a raw `sdk.*` command that bypasses
+     (1) and (2) entirely, malformed commands are rejected by local
+     serialization preflight and reported as an ordinary failed result,
      leaving `actions` empty so the outer `_after_step()` cannot re-raise.
      That last one is the "an invalid move cannot terminate game_task"
      proof this file exists for.
 
 None of these launch SC2. Layers (1) and (2) are pure input validation
 that never reaches a client, and (3) needs only a bare `ExecuteCodeBotAI`
-with a stubbed `_do_actions` -- the same "no real game underneath"
-approach `tests/test_mcp_server_realtime_refresh.py` documents.
+-- the same "no real game underneath" approach
+`tests/test_mcp_server_realtime_refresh.py` documents.
 """
 
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
+from sc2.action import combine_actions
 from sc2.position import Point2
 
 from sdk.bot import Bot, _normalize_move_target
@@ -55,6 +57,20 @@ from sdk.mcp_server import ExecuteCodeBotAI, _PendingRequest
 
 class _FakeClient:
     in_game = True
+
+
+class _RecordingActionClient:
+    in_game = True
+
+    def __init__(self) -> None:
+        self.flushed: list[list] = []
+
+    async def actions(self, actions) -> None:
+        list(combine_actions(actions))
+        self.flushed.append(list(actions))
+
+    async def _send_debug(self) -> None:
+        return None
 
 
 class _FakeUnit:
@@ -206,23 +222,19 @@ def test_unflushable_raw_action_cannot_terminate_the_game_task() -> None:
 
 async def _run_unflushable_raw_action_cannot_terminate_the_game_task() -> None:
     ai = await _make_execute_code_ai()
+    client = _RecordingActionClient()
+    ai.client = client
+    ai.state = SimpleNamespace(game_loop=1)
 
-    flushed: list[list] = []
-
-    async def _reject_on_serialize(actions, prevent_double: bool = True):
-        """Stands in for python-sc2 refusing a command while serializing it
-        -- the real failure was an AttributeError raised out of
-        `combine_actions` on a target that never should have been queued."""
-        flushed.append(list(actions))
-        raise AttributeError("'tuple' object has no attribute 'combining_tuple'")
-
-    ai._do_actions = _reject_on_serialize
-
-    # A raw sdk.* command that bypasses the verified bot.* tier entirely --
-    # exactly what layers 1 and 2 above cannot protect against.
-    result = await _run_one_call(ai, code="sdk.actions.append('malformed-command')")
-
-    assert flushed == [["malformed-command"]], "the queued raw command should have been flushed inside on_step"
+    # Build the same real python-sc2 UnitCommand shape that killed the live
+    # match. UnitCommand accepts the tuple; combine_actions rejects it later.
+    code = (
+        "from sc2.ids.ability_id import AbilityId\n"
+        "from sc2.unit_command import UnitCommand\n"
+        "unit = type('Unit', (), {'tag': 7, 'orders': []})()\n"
+        "sdk.actions.append(UnitCommand(AbilityId.MOVE, unit, (145, 114)))"
+    )
+    result = await asyncio.wait_for(_run_one_call(ai, code=code), timeout=1.0)
 
     # The regression itself: the queue must be empty once on_step returns.
     assert ai.actions == [], "a rejected command must not stay queued for the outer flush to re-raise"
@@ -240,28 +252,63 @@ async def _run_unflushable_raw_action_cannot_terminate_the_game_task() -> None:
     assert "discarded" in result.error
     assert "Point2" in result.error, "the error should point at the usual cause"
 
+    await ai._after_step()
+    assert client.flushed == [], "the actual outer flush must find no poisoned action"
 
-def test_successful_raw_action_flush_still_dispatches_and_reports_ok() -> None:
-    asyncio.run(_run_successful_raw_action_flush_still_dispatches_and_reports_ok())
+
+def test_successful_raw_action_is_left_for_outer_flush_and_reports_ok() -> None:
+    asyncio.run(_run_successful_raw_action_is_left_for_outer_flush_and_reports_ok())
 
 
-async def _run_successful_raw_action_flush_still_dispatches_and_reports_ok() -> None:
-    """The drain must not change behavior for raw commands that are fine --
-    they still get sent, and the call still succeeds."""
+async def _run_successful_raw_action_is_left_for_outer_flush_and_reports_ok() -> None:
+    """Preflight validates only; python-sc2's outer flush still dispatches."""
     ai = await _make_execute_code_ai()
+    client = _RecordingActionClient()
+    ai.client = client
+    ai.state = SimpleNamespace(game_loop=1)
 
-    flushed: list[list] = []
+    code = (
+        "from sc2.ids.ability_id import AbilityId\n"
+        "from sc2.unit_command import UnitCommand\n"
+        "unit = type('Unit', (), {'tag': 7, 'orders': []})()\n"
+        "sdk.actions.append(UnitCommand(AbilityId.STOP, unit))\n"
+        "41 + 1"
+    )
+    result = await _run_one_call(ai, code=code)
 
-    async def _accept(actions, prevent_double: bool = True):
-        flushed.append(list(actions))
-        return None
-
-    ai._do_actions = _accept
-
-    result = await _run_one_call(ai, code="sdk.actions.append('fine-command')\n41 + 1")
-
-    assert flushed == [["fine-command"]]
-    assert ai.actions == []
+    assert client.flushed == [], "on_step preflight must not perform transport I/O"
+    assert len(ai.actions) == 1
     assert result.ok is True
     assert result.result == "42"
     assert result.error is None
+
+    await ai._after_step()
+    assert len(client.flushed) == 1
+    assert len(client.flushed[0]) == 1
+    assert ai.actions == []
+
+
+def test_timed_out_snippet_discards_unsent_raw_actions_before_retry() -> None:
+    asyncio.run(_run_timed_out_snippet_discards_unsent_raw_actions_before_retry())
+
+
+async def _run_timed_out_snippet_discards_unsent_raw_actions_before_retry() -> None:
+    ai = await _make_execute_code_ai()
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    code = (
+        "import asyncio\n"
+        "from sc2.ids.ability_id import AbilityId\n"
+        "from sc2.unit_command import UnitCommand\n"
+        "unit = type('Unit', (), {'tag': 7, 'orders': []})()\n"
+        "sdk.actions.append(UnitCommand(AbilityId.STOP, unit))\n"
+        "await asyncio.sleep(10**9)"
+    )
+    request = _PendingRequest(code=code, future=future, timeout_seconds=0.01)
+    await ai._queue.put(request)
+
+    await ai.on_step(0)
+
+    assert ai.actions == [], "a cancelled attempt must not dispatch pending raw actions later"
+    assert ai.unit_tags_received_action == set()
+    assert request.attempt == 2
+    assert ai._queue.qsize() == 1, "the existing one-retry policy should remain intact"
